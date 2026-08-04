@@ -256,23 +256,6 @@ class ProxyState:
 proxy_state = None
 
 
-def pd_stall_print(message: str, *args) -> None:
-    print(message % args, flush=True)
-
-
-async def pd_stall_heartbeat() -> None:
-    while True:
-        pd_stall_print(
-            "[PD_STALL] role=proxy stage=heartbeat pending_requests=%s "
-            "pending_futures=%s prefill_active=%s decode_active=%s",
-            len(proxy_state.req_data_dict),
-            sum(not future.done() for future in proxy_state.req_id_future.values()),
-            [server.active_requests for server in proxy_state.prefillers],
-            [server.active_requests for server in proxy_state.decoders],
-        )
-        await asyncio.sleep(10)
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
@@ -311,19 +294,12 @@ def parse_args():
 async def lifespan(app: FastAPI):
     global proxy_state
     proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
-    print(
-        f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.",
-        flush=True,
-    )
-    heartbeat_task = asyncio.create_task(pd_stall_heartbeat())
-    try:
-        yield
-    finally:
-        heartbeat_task.cancel()
-        for p in proxy_state.prefillers:
-            await p.client.aclose()
-        for d in proxy_state.decoders:
-            await d.client.aclose()
+    print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+    yield
+    for p in proxy_state.prefillers:
+        await p.client.aclose()
+    for d in proxy_state.decoders:
+        await d.client.aclose()
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -375,19 +351,18 @@ async def send_request_to_service(
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            pd_stall_print(
-                "[PD_STALL] role=proxy stage=prefill_http_enter request_id=%s "
-                "prefiller_id=%s base_url=%s endpoint=%s attempt=%s",
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=prefill_request_start request_id=%s "
+                "prefiller_id=%s endpoint=%s attempt=%s",
                 request_id,
                 prefiller_id,
-                client.base_url,
                 endpoint,
                 attempt,
             )
             response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
-            pd_stall_print(
-                "[PD_STALL] role=proxy stage=prefill_http_done "
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=prefill_request_returned "
                 "request_id=%s status_code=%s",
                 request_id,
                 response.status_code,
@@ -417,8 +392,8 @@ async def stream_service_response_with_retry(
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
         try:
-            pd_stall_print(
-                "[PD_STALL] role=proxy stage=decode_http_enter request_id=%s "
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=decode_http_enter request_id=%s "
                 "base_url=%s endpoint=%s attempt=%s",
                 request_id,
                 client.base_url,
@@ -426,8 +401,8 @@ async def stream_service_response_with_retry(
                 attempt,
             )
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
-                pd_stall_print(
-                    "[PD_STALL] role=proxy stage=decode_http_headers "
+                logger.warning(
+                    "[QWEN35_PD_STANDALONE] stage=decode_http_headers "
                     "request_id=%s status_code=%s",
                     request_id,
                     response.status_code,
@@ -479,8 +454,8 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
-        pd_stall_print(
-            "[PD_STALL] role=proxy stage=request_enter request_id=%s api=%s",
+        logger.warning(
+            "[QWEN35_PD_STANDALONE] stage=proxy_request_enter request_id=%s api=%s",
             request_id,
             api,
         )
@@ -527,8 +502,8 @@ async def _handle_completions(api: str, request: Request):
             try:
                 while retry:
                     retry = False
-                    pd_stall_print(
-                        "[PD_STALL] role=proxy stage=decode_request_start "
+                    logger.warning(
+                        "[QWEN35_PD_STANDALONE] stage=decode_request_start "
                         "request_id=%s decoder_idx=%s endpoint=%s",
                         request_id,
                         decoder_idx,
@@ -668,8 +643,8 @@ async def metaserver(request: Request):
         kv_transfer_params = await request.json()
 
         request_id = kv_transfer_params["request_id"]
-        pd_stall_print(
-            "[PD_STALL] role=proxy stage=metaserver_received request_id=%s",
+        logger.warning(
+            "[QWEN35_PD_STANDALONE] stage=metaserver_received request_id=%s",
             request_id,
         )
         assert request_id in proxy_state.req_data_dict
