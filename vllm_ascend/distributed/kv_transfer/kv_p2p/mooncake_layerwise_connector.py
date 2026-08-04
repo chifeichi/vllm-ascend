@@ -84,6 +84,10 @@ DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
 
 
+def pd_stall_print(message: str, *args) -> None:
+    print(message % args, flush=True)
+
+
 @dataclass
 class LayerMetadata:
     tensor_group_idx: list[int]
@@ -438,7 +442,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     def _transfer_kv_cache(self, send_task: SendTask):
-        logger.warning(
+        pd_stall_print(
             "[PD_STALL] role=P stage=layer_transfer_enter tp_rank=%s "
             "layer_idx=%s total_layers=%s layer_name=%s req_ids=%s",
             self.tp_rank,
@@ -493,7 +497,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
 
-        logger.warning(
+        pd_stall_print(
             "[PD_STALL] role=P stage=layer_event_ready tp_rank=%s "
             "layer_idx=%s layer_name=%s req_ids=%s",
             self.tp_rank,
@@ -503,7 +507,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         )
 
         if not session_meta:
-            logger.warning(
+            pd_stall_print(
                 "[PD_STALL] role=P stage=layer_not_sent reason=no_session "
                 "tp_rank=%s layer_idx=%s layer_name=%s",
                 self.tp_rank,
@@ -513,7 +517,7 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=P stage=layer_send_enter tp_rank=%s "
                     "layer_idx=%s layer_name=%s req_ids=%s session_id=%s "
                     "range_count=%s bytes=%s",
@@ -529,7 +533,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
                 )
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=P stage=layer_send_done tp_rank=%s "
                     "layer_idx=%s layer_name=%s req_ids=%s session_id=%s ret=%s",
                     self.tp_rank,
@@ -568,7 +572,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
             else:
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=P stage=layer_not_sent reason=no_memory_ranges "
                     "tp_rank=%s layer_idx=%s layer_name=%s req_ids=%s session_id=%s",
                     self.tp_rank,
@@ -686,7 +690,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         request_id = msg[1]
                         trans_count = msg[2]
                         side_channel_path = msg[3]
-                        logger.warning(
+                        pd_stall_print(
                             "[PD_STALL] role=D stage=done_signal_received "
                             "request_id=%s trans_count=%s source=%s",
                             request_id,
@@ -1029,7 +1033,7 @@ class MooncakeLayerwiseConnectorScheduler:
                 remote_cached_tokens=remote_cached_tokens,
             )
             if not do_virtual:
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=D stage=metaserver_submit request_id=%s url=%s",
                     external_req_id,
                     params.get("metaserver", None),
@@ -1059,7 +1063,7 @@ class MooncakeLayerwiseConnectorScheduler:
                 local_computed_tokens=local_computed_tokens,
                 request=request,
             )
-            logger.warning(
+            pd_stall_print(
                 "[PD_STALL] role=P stage=scheduler_request_ready request_id=%s "
                 "prompt_tokens=%s remote_cached_tokens=%s",
                 request.request_id,
@@ -1153,7 +1157,7 @@ class MooncakeLayerwiseConnectorScheduler:
 
                     add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
                     if chunk_finish:
-                        logger.warning(
+                        pd_stall_print(
                             "[PD_STALL] role=P stage=prefill_chunk_finished "
                             "request_id=%s computed_tokens=%s prompt_tokens=%s",
                             req_id,
@@ -1169,7 +1173,7 @@ class MooncakeLayerwiseConnectorScheduler:
         while retry < 3 and success is False:
             retry += 1
             try:
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=D stage=metaserver_post_enter "
                     "request_id=%s attempt=%s url=%s",
                     message.get("request_id"),
@@ -1178,7 +1182,7 @@ class MooncakeLayerwiseConnectorScheduler:
                 )
                 response = self.metaserver_client.post(url, json=message)
                 success = True
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=D stage=metaserver_post_done "
                     "request_id=%s status_code=%s",
                     message.get("request_id"),
@@ -1303,6 +1307,27 @@ class MooncakeLayerwiseConnectorWorker:
         self.virtual_request: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
+        threading.Thread(
+            target=self._pd_stall_heartbeat,
+            daemon=True,
+            name="PDStallHeartbeat",
+        ).start()
+
+    def _pd_stall_heartbeat(self) -> None:
+        role = "P" if self.vllm_config.kv_transfer_config.is_kv_producer else "D"
+        while True:
+            send_queue_size = self.kv_send_layer_thread.send_queue.qsize() if self.kv_send_layer_thread else -1
+            pd_stall_print(
+                "[PD_STALL] role=%s stage=heartbeat pid=%s tp_rank=%s "
+                "current_layer=%s send_queue_size=%s recv_pending=%s",
+                role,
+                os.getpid(),
+                self.tp_rank,
+                getattr(self, "current_layer", -1),
+                send_queue_size,
+                len(self._recving_metadata),
+            )
+            time.sleep(10)
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1505,7 +1530,7 @@ class MooncakeLayerwiseConnectorWorker:
         )
         failed_recving = {self.request_map[s] for s in failed_recving if s in self.request_map}
         if done_recving or failed_recving:
-            logger.warning(
+            pd_stall_print(
                 "[PD_STALL] role=D stage=finished_recving_reported done=%s failed=%s",
                 done_recving,
                 failed_recving,
@@ -1700,7 +1725,7 @@ class MooncakeLayerwiseConnectorWorker:
         """Start loading KV blocks from remote engine."""
         self.current_layer = 0
         if self.vllm_config.kv_transfer_config.is_kv_producer:
-            logger.warning(
+            pd_stall_print(
                 "[PD_STALL] role=P stage=worker_request_start total_layers=%s reqs=%s",
                 self.total_layers,
                 [
@@ -1717,7 +1742,7 @@ class MooncakeLayerwiseConnectorWorker:
                 assert self.kv_recv_layer_thread is not None
                 self.request_map[external_req_id] = req_id
                 self._recving_metadata[req_id] = meta
-                logger.warning(
+                pd_stall_print(
                     "[PD_STALL] role=D stage=recv_registered request_id=%s "
                     "external_request_id=%s",
                     req_id,
@@ -1808,6 +1833,14 @@ class MooncakeLayerwiseConnectorWorker:
     ) -> None:
         """MooncakeLayerwiseConnector does not save explicitly."""
         if self.vllm_config.kv_transfer_config.is_kv_producer and connector_metadata.requests.keys():
+            pd_stall_print(
+                "[PD_STALL] role=P stage=save_layer_enter tp_rank=%s "
+                "layer_idx=%s layer_name=%s req_ids=%s",
+                self.tp_rank,
+                self.current_layer,
+                layer_name,
+                list(connector_metadata.requests),
+            )
             if self.current_layer >= self.total_layers:
                 self.current_layer += 1
                 return
@@ -1823,6 +1856,14 @@ class MooncakeLayerwiseConnectorWorker:
                 reshape_cache_event = attn_metadata[layer_name].reshape_cache_event
             else:
                 reshape_cache_event = attn_metadata.reshape_cache_event
+
+            pd_stall_print(
+                "[PD_STALL] role=P stage=reshape_event_ready tp_rank=%s "
+                "layer_idx=%s layer_name=%s",
+                self.tp_rank,
+                self.current_layer,
+                layer_name,
+            )
 
             send_task = connector_metadata.send_task
             layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
@@ -1841,7 +1882,21 @@ class MooncakeLayerwiseConnectorWorker:
             ):
                 assert self.resharding_stream is not None
                 with npu_stream_switch(self.resharding_stream):
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=reshape_event_wait_enter "
+                        "tp_rank=%s layer_idx=%s layer_name=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
+                    )
                     reshape_cache_event.wait()
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=reshape_event_wait_done "
+                        "tp_rank=%s layer_idx=%s layer_name=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
+                    )
                     device = self.k_buffer.device  # type: ignore
                     # Initialize buffers
                     keys = torch.empty(
@@ -1856,6 +1911,13 @@ class MooncakeLayerwiseConnectorWorker:
                     )
 
                     # Load cache data into buffers
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=paged_cache_load_enter "
+                        "tp_rank=%s layer_idx=%s layer_name=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
+                    )
                     torch_npu.atb.npu_paged_cache_load(
                         kv_layer[0],
                         kv_layer[1],
@@ -1864,6 +1926,13 @@ class MooncakeLayerwiseConnectorWorker:
                         seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
                         key=keys,
                         value=values,
+                    )
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=paged_cache_load_done "
+                        "tp_rank=%s layer_idx=%s layer_name=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
                     )
                     if self.pd_head_ratio != 1:
                         # sort kv caches for each block
@@ -1885,7 +1954,21 @@ class MooncakeLayerwiseConnectorWorker:
                         keys = keys.reshape(-1, *kv_layer[0].shape[2:])
                         values = values.reshape(-1, *kv_layer[1].shape[2:])
 
+                        pd_stall_print(
+                            "[PD_STALL] role=P stage=kv_alltoall_enter "
+                            "tp_rank=%s layer_idx=%s layer_name=%s",
+                            self.tp_rank,
+                            self.current_layer,
+                            layer_name,
+                        )
                         (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
+                        pd_stall_print(
+                            "[PD_STALL] role=P stage=kv_alltoall_done "
+                            "tp_rank=%s layer_idx=%s layer_name=%s",
+                            self.tp_rank,
+                            self.current_layer,
+                            layer_name,
+                        )
                     if self.enable_c8_quant:
                         layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
                         quant_keys = torch.clamp(
@@ -1925,7 +2008,7 @@ class MooncakeLayerwiseConnectorWorker:
             )
             for req_id, req_meta in connector_metadata.requests.items():
                 if len(req_meta.local_block_ids[layer_group_idx]) == 0:
-                    logger.warning(
+                    pd_stall_print(
                         "[PD_STALL] role=P stage=layer_not_sent "
                         "reason=no_local_blocks tp_rank=%s layer_idx=%s "
                         "layer_name=%s request_id=%s group_idx=%s",
@@ -1937,7 +2020,23 @@ class MooncakeLayerwiseConnectorWorker:
                     )
                     continue
                 try:
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=decoder_info_enter tp_rank=%s "
+                        "layer_idx=%s layer_name=%s request_id=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
+                        req_id,
+                    )
                     req_meta_update = self.update_decoder_info(req_id, req_meta)
+                    pd_stall_print(
+                        "[PD_STALL] role=P stage=decoder_info_done tp_rank=%s "
+                        "layer_idx=%s layer_name=%s request_id=%s",
+                        self.tp_rank,
+                        self.current_layer,
+                        layer_name,
+                        req_id,
+                    )
                 except Exception as e:
                     logger.warning(
                         "MooncakeLayerwiseConnector transfer fail. req_id=%s, layer_idx=%s, error=%s. ",
@@ -1949,7 +2048,7 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
-            logger.warning(
+            pd_stall_print(
                 "[PD_STALL] role=P stage=layer_enqueue tp_rank=%s layer_idx=%s "
                 "total_layers=%s layer_name=%s reqs=%s",
                 self.tp_rank,
@@ -1958,7 +2057,23 @@ class MooncakeLayerwiseConnectorWorker:
                 layer_name,
                 [(req_id, req_meta.chunk_finish) for req_id, req_meta in layer_send_task.send_request.items()],
             )
+            pd_stall_print(
+                "[PD_STALL] role=P stage=queue_put_enter tp_rank=%s "
+                "layer_idx=%s layer_name=%s queue_size=%s",
+                self.tp_rank,
+                self.current_layer,
+                layer_name,
+                self.kv_send_layer_thread.send_queue.qsize(),
+            )
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            pd_stall_print(
+                "[PD_STALL] role=P stage=queue_put_done tp_rank=%s "
+                "layer_idx=%s layer_name=%s queue_size=%s",
+                self.tp_rank,
+                self.current_layer,
+                layer_name,
+                self.kv_send_layer_thread.send_queue.qsize(),
+            )
             self.current_layer += 1
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,
@@ -2045,7 +2160,7 @@ class MooncakeLayerwiseConnectorWorker:
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
         external_req_id = get_external_request_id(req_id)
         send_msg_type = DONE_SENDING_MSG if trans_flag else FAILED_SENDING_MSG
-        logger.warning(
+        pd_stall_print(
             "[PD_STALL] role=P stage=done_signal_enter request_id=%s "
             "destination=%s:%s trans_flag=%s",
             external_req_id,
@@ -2080,7 +2195,7 @@ class MooncakeLayerwiseConnectorWorker:
                         ack = sock.recv()
                         if ack != b"ACK":
                             raise ValueError(f"Unexpected ACK response: {ack}")
-                        logger.warning(
+                        pd_stall_print(
                             "[PD_STALL] role=P stage=done_signal_acked "
                             "request_id=%s attempt=%s",
                             external_req_id,
