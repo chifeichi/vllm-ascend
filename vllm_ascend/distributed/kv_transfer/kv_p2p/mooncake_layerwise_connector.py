@@ -82,6 +82,7 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+PD_HANG_DEBUG = os.environ.get("VLLM_ASCEND_PD_HANG_DEBUG", "0") == "1"
 
 
 @dataclass
@@ -438,6 +439,16 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     def _transfer_kv_cache(self, send_task: SendTask):
+        debug_last_layer = PD_HANG_DEBUG and send_task.layer_idx == self.total_layers - 1
+        if debug_last_layer:
+            logger.warning(
+                "[QWEN35_PD_HANG] stage=last_transfer_enter layer_idx=%s "
+                "total_layers=%s layer_name=%s req_ids=%s",
+                send_task.layer_idx,
+                self.total_layers,
+                send_task.layer_name,
+                list(send_task.send_request),
+            )
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
@@ -490,6 +501,16 @@ class KVCacheSendingLayerThread(threading.Thread):
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
                 )
+                if debug_last_layer:
+                    logger.warning(
+                        "[QWEN35_PD_HANG] stage=last_transfer_done layer_idx=%s "
+                        "total_layers=%s req_ids=%s session_id=%s ret=%s",
+                        send_task.layer_idx,
+                        self.total_layers,
+                        transfer_meta.req_ids,
+                        session_id,
+                        ret,
+                    )
                 if ret < 0:
                     logger.error(
                         "Mooncake transfer failed for send requests. req_ids=%s, destination=%s, ret=%d. ",
@@ -1406,6 +1427,12 @@ class MooncakeLayerwiseConnectorWorker:
             else set()
         )
         failed_recving = {self.request_map[s] for s in failed_recving if s in self.request_map}
+        if PD_HANG_DEBUG and (done_recving or failed_recving):
+            logger.warning(
+                "[QWEN35_PD_HANG] stage=finished_recving_reported done=%s failed=%s",
+                done_recving,
+                failed_recving,
+            )
         for req_id in failed_recving:
             if meta := self._recving_metadata.get(req_id):
                 self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
@@ -1595,6 +1622,15 @@ class MooncakeLayerwiseConnectorWorker:
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         self.current_layer = 0
+        if PD_HANG_DEBUG and self.vllm_config.kv_transfer_config.is_kv_producer:
+            logger.warning(
+                "[QWEN35_PD_HANG] stage=producer_start_load total_layers=%s reqs=%s",
+                self.total_layers,
+                [
+                    (req_id, req_meta.chunk_finish, req_meta.local_computed_tokens)
+                    for req_id, req_meta in metadata.requests.items()
+                ],
+            )
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             for req_id, meta in metadata.requests.items():
                 if meta.do_virtual:
@@ -1689,6 +1725,15 @@ class MooncakeLayerwiseConnectorWorker:
     ) -> None:
         """MooncakeLayerwiseConnector does not save explicitly."""
         if self.vllm_config.kv_transfer_config.is_kv_producer and connector_metadata.requests.keys():
+            if PD_HANG_DEBUG and (self.current_layer % 4 == 0 or self.current_layer == self.total_layers - 1):
+                logger.warning(
+                    "[QWEN35_PD_HANG] stage=layer_progress current_layer=%s "
+                    "total_layers=%s layer_name=%s req_ids=%s",
+                    self.current_layer,
+                    self.total_layers,
+                    layer_name,
+                    list(connector_metadata.requests),
+                )
             if self.current_layer >= self.total_layers:
                 self.current_layer += 1
                 return
@@ -1820,6 +1865,18 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if PD_HANG_DEBUG and self.current_layer == self.total_layers - 1:
+                logger.warning(
+                    "[QWEN35_PD_HANG] stage=last_layer_enqueue current_layer=%s "
+                    "total_layers=%s layer_name=%s reqs=%s",
+                    self.current_layer,
+                    self.total_layers,
+                    layer_name,
+                    [
+                        (req_id, req_meta.chunk_finish)
+                        for req_id, req_meta in layer_send_task.send_request.items()
+                    ],
+                )
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 

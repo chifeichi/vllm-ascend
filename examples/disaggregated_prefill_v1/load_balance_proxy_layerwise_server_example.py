@@ -351,8 +351,22 @@ async def send_request_to_service(
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=prefill_request_start request_id=%s "
+                "prefiller_id=%s endpoint=%s attempt=%s",
+                request_id,
+                prefiller_id,
+                endpoint,
+                attempt,
+            )
             response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=prefill_request_returned "
+                "request_id=%s status_code=%s",
+                request_id,
+                response.status_code,
+            )
             if request_id in proxy_state.req_id_future:
                 result_future = proxy_state.req_id_future[request_id]
                 result_future.set_result(response.json()["kv_transfer_params"])
@@ -426,6 +440,11 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
+        logger.warning(
+            "[QWEN35_PD_STANDALONE] stage=proxy_request_enter request_id=%s api=%s",
+            request_id,
+            api,
+        )
         request_id_api = get_api_request_id(api, request_id)
         proxy_state.req_data_dict[request_id_api] = (copy.deepcopy(req_data), request_length, api)
         req_data["kv_transfer_params"] = {
@@ -469,6 +488,13 @@ async def _handle_completions(api: str, request: Request):
             try:
                 while retry:
                     retry = False
+                    logger.warning(
+                        "[QWEN35_PD_STANDALONE] stage=decode_request_start "
+                        "request_id=%s decoder_idx=%s endpoint=%s",
+                        request_id,
+                        decoder_idx,
+                        api,
+                    )
                     async for chunk in stream_service_response_with_retry(
                         decoder.client,
                         api,
@@ -603,6 +629,10 @@ async def metaserver(request: Request):
         kv_transfer_params = await request.json()
 
         request_id = kv_transfer_params["request_id"]
+        logger.warning(
+            "[QWEN35_PD_STANDALONE] stage=metaserver_received request_id=%s",
+            request_id,
+        )
         assert request_id in proxy_state.req_data_dict
         req_data, request_length, api = proxy_state.req_data_dict[request_id]
         request_id = get_origin_request_id(api, request_id)
