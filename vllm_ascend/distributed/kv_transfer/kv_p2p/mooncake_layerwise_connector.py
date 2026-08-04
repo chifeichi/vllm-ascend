@@ -928,6 +928,15 @@ class MooncakeLayerwiseConnectorScheduler:
 
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
+            logger.warning(
+                "[QWEN35_PD_D] stage=matched_tokens_enter request_id=%s "
+                "prompt_tokens=%s num_computed_tokens=%s block_size=%s hybrid=%s",
+                request.request_id,
+                len(request.prompt_token_ids),
+                num_computed_tokens,
+                self.block_size,
+                self.need_truncate,
+            )
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
             return count, count > 0
@@ -951,6 +960,14 @@ class MooncakeLayerwiseConnectorScheduler:
             local_block_ids = (blocks.get_block_ids()) if num_external_tokens > 0 else []
             remote_block_ids = self._trim_hybrid_remote_block_ids(local_block_ids, len(request.prompt_token_ids))
             remote_cached_tokens = request.num_computed_tokens
+            logger.warning(
+                "[QWEN35_PD_D] stage=blocks_allocated request_id=%s "
+                "num_external_tokens=%s local_block_counts=%s remote_block_counts=%s",
+                request.request_id,
+                num_external_tokens,
+                [len(group) for group in local_block_ids],
+                [len(group) for group in remote_block_ids],
+            )
             # Get unhashed blocks to pull from remote.
             logger.debug(
                 "MooncakeLayerwiseConnector update_state_after_alloc: add %s to need recv queue", request.request_id
