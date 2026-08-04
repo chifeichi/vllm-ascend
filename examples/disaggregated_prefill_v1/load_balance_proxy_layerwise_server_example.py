@@ -392,7 +392,21 @@ async def stream_service_response_with_retry(
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
         try:
+            logger.warning(
+                "[QWEN35_PD_STANDALONE] stage=decode_http_enter request_id=%s "
+                "base_url=%s endpoint=%s attempt=%s",
+                request_id,
+                client.base_url,
+                endpoint,
+                attempt,
+            )
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
+                logger.warning(
+                    "[QWEN35_PD_STANDALONE] stage=decode_http_headers "
+                    "request_id=%s status_code=%s",
+                    request_id,
+                    response.status_code,
+                )
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
