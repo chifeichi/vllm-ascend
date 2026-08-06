@@ -72,6 +72,7 @@ from vllm_ascend.utils import (
     register_ascend_customop,
     setup_ascend_local_comm_res,
 )
+from vllm_ascend.worker.execution_trace import execution_trace
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -562,6 +563,11 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        execution_trace(
+            "worker.execute_model:enter",
+            synchronize=True,
+            total_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
@@ -593,7 +599,13 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        execution_trace("worker.execute_model:before_model_runner", synchronize=True)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        execution_trace(
+            "worker.execute_model:after_model_runner",
+            synchronize=True,
+            output_type=type(output).__name__,
+        )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -631,7 +643,14 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        execution_trace("worker.sample_tokens:enter", synchronize=True)
+        output = self.model_runner.sample_tokens(grammar_output)
+        execution_trace(
+            "worker.sample_tokens:exit",
+            synchronize=True,
+            output_type=type(output).__name__,
+        )
+        return output
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

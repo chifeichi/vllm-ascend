@@ -168,6 +168,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
+from vllm_ascend.worker.execution_trace import execution_trace
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -1700,6 +1701,11 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        execution_trace(
+            "model_runner.execute_model:enter",
+            synchronize=True,
+            total_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -1784,9 +1790,11 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
+                execution_trace("model_runner.update_states:before", synchronize=True)
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                execution_trace("model_runner.update_states:after", synchronize=True)
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data()
@@ -1832,6 +1840,12 @@ class NPUModelRunner(GPUModelRunner):
                 self._start_dump_data()
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+                execution_trace(
+                    "model_runner.prepare_inputs:before",
+                    synchronize=True,
+                    num_reqs=num_reqs,
+                    total_tokens=num_scheduled_tokens,
+                )
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -1840,6 +1854,7 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                execution_trace("model_runner.prepare_inputs:after", synchronize=True)
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
@@ -1968,6 +1983,7 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                execution_trace("model_runner.attention_metadata:before", synchronize=True)
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -1981,12 +1997,14 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                execution_trace("model_runner.attention_metadata:after", synchronize=True)
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
                     num_tokens_padded,
                 )
 
+            execution_trace("model_runner.preprocess:before", synchronize=True)
             (
                 input_ids,
                 inputs_embeds,
@@ -1999,6 +2017,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            execution_trace("model_runner.preprocess:after", synchronize=True)
 
             # update global cos, sin
             update_cos_sin(positions)
@@ -2047,9 +2066,15 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            execution_trace(
+                "model_runner.model_forward:before",
+                synchronize=True,
+                padded_tokens=num_tokens_padded,
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            execution_trace("model_runner.model_forward:after", synchronize=True)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2075,7 +2100,9 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                execution_trace("model_runner.compute_logits:before", synchronize=True)
                 logits = self.model.compute_logits(sample_hidden_states)
+                execution_trace("model_runner.compute_logits:after", synchronize=True)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2114,6 +2141,8 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.kv_connector_output = kv_connector_output
 
+        execution_trace("model_runner.execute_model:state_ready", synchronize=True)
+
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
@@ -2124,6 +2153,7 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        execution_trace("model_runner.sample_tokens:enter", synchronize=True)
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -2170,7 +2200,9 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            execution_trace("model_runner.sample:before", synchronize=True)
             sampler_output = self._sample(logits, spec_decode_metadata)
+            execution_trace("model_runner.sample:after", synchronize=True)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2219,6 +2251,7 @@ class NPUModelRunner(GPUModelRunner):
                 with record_function_or_nullcontext("draft_token"):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
+        execution_trace("model_runner.bookkeeping:before", synchronize=True)
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2234,6 +2267,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        execution_trace("model_runner.bookkeeping:after", synchronize=True)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2271,6 +2305,8 @@ class NPUModelRunner(GPUModelRunner):
                         for req_id in req_ids_output_copy
                     ]
 
+        execution_trace("model_runner.draft:after", synchronize=True)
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2284,6 +2320,7 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
+        execution_trace("model_runner.sample_tokens:output_ready", synchronize=True)
         if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
             self, "_execution_start_time"
         ):
