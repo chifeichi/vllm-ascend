@@ -423,8 +423,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
+            execution_trace("gdn.prefill:initial_state_before", synchronize=True, layer=self.prefix)
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
+            execution_trace("gdn.prefill:initial_state_after", synchronize=True, layer=self.prefix)
+            execution_trace("gdn.prefill:clear_state_before", synchronize=True, layer=self.prefix)
             clear_ssm_states(initial_state, prefill_has_initial_state)
+            execution_trace("gdn.prefill:clear_state_after", synchronize=True, layer=self.prefix)
+            execution_trace("gdn.prefill:chunk_rule_before", synchronize=True, layer=self.prefix)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -438,7 +443,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
+            execution_trace("gdn.prefill:chunk_rule_after", synchronize=True, layer=self.prefix)
+            execution_trace("gdn.prefill:state_writeback_before", synchronize=True, layer=self.prefix)
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+            execution_trace("gdn.prefill:state_writeback_after", synchronize=True, layer=self.prefix)
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
