@@ -34,6 +34,7 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from vllm_ascend.worker.execution_trace import execution_trace
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -76,6 +77,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
+        execution_trace(
+            "gdn.forward:enter",
+            synchronize=True,
+            layer=self.prefix,
+            num_tokens=num_tokens,
+        )
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -110,6 +117,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.head_k_dim,
                     self.head_v_dim,
                 )
+        execution_trace("gdn.forward:projection_done", synchronize=True, layer=self.prefix)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -122,6 +130,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
+        execution_trace("gdn.forward:core_before", synchronize=True, layer=self.prefix)
         torch.ops.vllm.qwen_gdn_attention_core(
             mixed_qkv,
             b,
@@ -130,6 +139,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.prefix,
             False,
         )
+        execution_trace("gdn.forward:core_after", synchronize=True, layer=self.prefix)
 
         # ============================================================
         # Part 3: Output Projection
@@ -142,6 +152,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         out, _ = self.out_proj(core_attn_out)
+        execution_trace("gdn.forward:output_projection_done", synchronize=True, layer=self.prefix)
         if output is not None:
             output[:num_tokens] = out
         return out
@@ -174,6 +185,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        execution_trace(
+            "gdn.core:enter",
+            synchronize=True,
+            layer=self.prefix,
+            num_actual_tokens=num_actual_tokens,
+            num_prefills=attn_metadata.num_prefills,
+            num_decodes=attn_metadata.num_decodes,
+        )
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -308,11 +327,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
+        execution_trace("gdn.core:causal_conv_done", synchronize=True, layer=self.prefix)
+
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
+        execution_trace("gdn.core:gating_before", synchronize=True, layer=self.prefix)
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        execution_trace("gdn.core:gating_after", synchronize=True, layer=self.prefix)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
@@ -336,6 +359,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         # 2.1: Process the multi-query part
+        execution_trace("gdn.core:recurrent_before", synchronize=True, layer=self.prefix)
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
@@ -440,6 +464,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
+        execution_trace("gdn.core:recurrent_after", synchronize=True, layer=self.prefix)
+
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
@@ -455,3 +481,4 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
         maybe_save_kv_layer_to_connector("", [])
+        execution_trace("gdn.core:exit", synchronize=True, layer=self.prefix)

@@ -100,14 +100,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Print coarse-grained execution markers from the NPU worker and model runner.
-    # Intended for diagnosing unexpected worker-process exits. Disabled by default.
-    "VLLM_ASCEND_EXECUTION_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_EXECUTION_TRACE", "0"))),
-    # Synchronize the NPU at traced execution boundaries. This makes asynchronous
-    # device failures visible at the stage that launched them, but is very slow.
-    "VLLM_ASCEND_EXECUTION_TRACE_SYNC": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_EXECUTION_TRACE_SYNC", "0"))
-    ),
 }
 
 # end-env-vars-definition
