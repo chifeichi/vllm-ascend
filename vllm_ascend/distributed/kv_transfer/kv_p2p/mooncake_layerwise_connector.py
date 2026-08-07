@@ -142,6 +142,7 @@ class SendTask:
     group_block_table: list[torch.Tensor | None] | None = None
     group_block_len_tensor: list[torch.Tensor | None] | None = None
     group_seq_start_tensor: list[torch.Tensor | None] | None = None
+    enqueued_at: float = 0.0
 
 
 @dataclass
@@ -262,6 +263,18 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        try:
+            self.timing_log_every = max(0, int(os.environ.get("VERL_PD_TIMING_LOG_EVERY", "0")))
+        except ValueError:
+            self.timing_log_every = 0
+        self.transfer_timing: dict[str, dict[str, float | int]] = {}
+
+    def _timing_enabled(self, req_id: str) -> bool:
+        return (
+            self.tp_rank == 0
+            and self.timing_log_every > 0
+            and int.from_bytes(hashlib.sha256(req_id.encode()).digest()[:8], "big") % self.timing_log_every == 0
+        )
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -438,6 +451,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     def _transfer_kv_cache(self, send_task: SendTask):
+        transfer_started_at = time.perf_counter()
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
@@ -459,12 +473,14 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         # Merge transmission tasks of the same session
         session_meta: dict[str, TransferMeta] = {}
+        request_transfer_bytes: dict[str, int] = {}
         for req_id, req_meta in send_task.send_request.items():
             session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
             if session_id not in session_meta:
                 session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
 
             (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
+            request_transfer_bytes[req_id] = sum(length_list)
 
             session_meta[session_id].src.extend(src_list)
             session_meta[session_id].dst.extend(dst_list)
@@ -509,10 +525,50 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         req_transfer_elapsed,
                     )
+                    for req_id in transfer_meta.req_ids:
+                        if not self._timing_enabled(req_id):
+                            continue
+                        timing = self.transfer_timing.setdefault(
+                            req_id,
+                            {
+                                "started_at": send_task.enqueued_at or transfer_started_at,
+                                "bytes": 0,
+                                "queue_wait_ms": 0.0,
+                                "prepare_wait_ms": 0.0,
+                                "mooncake_call_ms": 0.0,
+                                "layers": 0,
+                                "chunks": 0,
+                            },
+                        )
+                        timing["bytes"] += request_transfer_bytes[req_id]
+                        timing["queue_wait_ms"] += max(
+                            (transfer_started_at - send_task.enqueued_at) * 1000,
+                            0.0,
+                        )
+                        timing["prepare_wait_ms"] += (req_start_time - transfer_started_at) * 1000
+                        timing["mooncake_call_ms"] += req_transfer_elapsed
+                        timing["layers"] += 1
+                        if send_task.layer_idx == (self.total_layers - 1):
+                            timing["chunks"] += 1
                 if send_task.layer_idx == (self.total_layers - 1):
                     for req_id in transfer_meta.req_ids:
                         req_meta = send_task.send_request[req_id]
                         if req_meta.chunk_finish:
+                            timing = self.transfer_timing.pop(req_id, None)
+                            if timing is not None:
+                                logger.info(
+                                    "[VLLM_ASCEND_PD_TRANSFER] request_id=%s bytes=%d "
+                                    "transfer_window_ms=%.3f queue_wait_ms=%.3f "
+                                    "prepare_wait_ms=%.3f mooncake_call_ms=%.3f layers=%d chunks=%d",
+                                    req_id,
+                                    timing["bytes"],
+                                    (time.perf_counter() - timing["started_at"]) * 1000,
+                                    timing["queue_wait_ms"],
+                                    timing["prepare_wait_ms"],
+                                    timing["mooncake_call_ms"],
+                                    timing["layers"],
+                                    timing["chunks"],
+                                )
                             if req_id in self.failed_reqs:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
                                 self.failed_reqs.discard(req_id)
@@ -1820,6 +1876,8 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if self.kv_send_layer_thread.timing_log_every > 0:
+                layer_send_task.enqueued_at = time.perf_counter()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 
