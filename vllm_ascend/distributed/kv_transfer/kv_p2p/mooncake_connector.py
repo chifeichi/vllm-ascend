@@ -454,6 +454,17 @@ class KVCacheRecvingThread(threading.Thread):
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
+        try:
+            self.timing_log_every = max(0, int(os.environ.get("VERL_PD_TIMING_LOG_EVERY", "0")))
+        except ValueError:
+            self.timing_log_every = 0
+        if self.tp_rank == 0:
+            logger.warning(
+                "[VLLM_ASCEND_PD_TIMING_CONFIG_V1] pid=%s replica_rank=%s log_every=%s",
+                os.getpid(),
+                os.environ.get("VERL_REPLICA_RANK", "unknown"),
+                self.timing_log_every,
+            )
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -542,8 +553,21 @@ class KVCacheRecvingThread(threading.Thread):
             "remote_port_send_num": remote_port_send_num,
             "all_task_done": all_task_done,
         }
+        if self._timing_enabled(remote_request_id):
+            trans_info["timing_enqueued_at"] = time.perf_counter()
+            trans_info["timing_queue_depth"] = self.request_queue.qsize()
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
+
+    def _timing_enabled(self, request_id: str) -> bool:
+        external_request_id = get_external_request_id(request_id)
+        return (
+            self.tp_rank == 0
+            and self.timing_log_every > 0
+            and int.from_bytes(hashlib.sha256(external_request_id.encode()).digest()[:8], "big")
+            % self.timing_log_every
+            == 0
+        )
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -595,6 +619,9 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
         transfer_failed = self._is_failed_recv_request(request_id)
+        timing_enabled = "timing_enqueued_at" in req_meta
+        receiver_started_at = time.perf_counter() if timing_enabled else 0.0
+        status = "skipped_failed" if transfer_failed else "completed"
 
         try:
             if transfer_failed:
@@ -607,6 +634,7 @@ class KVCacheRecvingThread(threading.Thread):
                     logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
                 except Exception as e:
                     transfer_failed = True
+                    status = "error"
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
                     logger.exception("Failed to transfer KV cache for request %s: %s", remote_request_id, e)
         finally:
@@ -621,6 +649,31 @@ class KVCacheRecvingThread(threading.Thread):
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
             self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+            if timing_enabled:
+                finished_at = time.perf_counter()
+                enqueued_at = req_meta.get("timing_enqueued_at", receiver_started_at)
+                receiver_busy_ms = (finished_at - receiver_started_at) * 1000
+                prepare_ms = req_meta.get("timing_prepare_ms", 0.0)
+                mooncake_ms = req_meta.get("timing_mooncake_ms", 0.0)
+                logger.info(
+                    "[VLLM_ASCEND_PD_TRANSFER_V1] pid=%s replica_rank=%s request_id=%s bytes=%d "
+                    "transfer_window_ms=%.3f receiver_queue_wait_ms=%.3f receiver_busy_ms=%.3f "
+                    "prepare_ms=%.3f mooncake_call_ms=%.3f receiver_other_ms=%.3f "
+                    "queue_depth_at_enqueue=%d queue_depth_at_finish=%d status=%s",
+                    os.getpid(),
+                    os.environ.get("VERL_REPLICA_RANK", "unknown"),
+                    get_external_request_id(remote_request_id),
+                    req_meta.get("timing_bytes", 0),
+                    (finished_at - enqueued_at) * 1000,
+                    max((receiver_started_at - enqueued_at) * 1000, 0.0),
+                    receiver_busy_ms,
+                    prepare_ms,
+                    mooncake_ms,
+                    max(receiver_busy_ms - prepare_ms - mooncake_ms, 0.0),
+                    req_meta.get("timing_queue_depth", 0),
+                    self.request_queue.qsize(),
+                    status,
+                )
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -638,6 +691,8 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        timing_enabled = "timing_enqueued_at" in req_meta
+        timing_started_at = time.perf_counter() if timing_enabled else 0.0
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -801,6 +856,8 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
         if not src_list:
+            if timing_enabled:
+                req_meta["timing_prepare_ms"] = (time.perf_counter() - timing_started_at) * 1000
             return
 
         logger.debug(
@@ -811,7 +868,16 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        if timing_enabled:
+            transfer_started_at = time.perf_counter()
+            req_meta["timing_bytes"] = sum(length_list)
+            req_meta["timing_prepare_ms"] = (transfer_started_at - timing_started_at) * 1000
+            try:
+                ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            finally:
+                req_meta["timing_mooncake_ms"] = (time.perf_counter() - transfer_started_at) * 1000
+        else:
+            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -2796,6 +2862,14 @@ def string_to_int64_hash(input_str):
     trunked_bytes = hashed_bytes[:8]
     uint64_value = struct.unpack("<Q", trunked_bytes)[0]
     return uint64_value
+
+
+def get_external_request_id(request_id: str) -> str:
+    # vLLM EngineCore appends a 9-character suffix to the HTTP request ID.
+    request_id = request_id[:-9]
+    if request_id.endswith(("_P", "_D")):
+        request_id = request_id[:-2]
+    return request_id
 
 
 def ensure_zmq_send(
