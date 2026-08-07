@@ -268,12 +268,21 @@ class KVCacheSendingLayerThread(threading.Thread):
         except ValueError:
             self.timing_log_every = 0
         self.transfer_timing: dict[str, dict[str, float | int]] = {}
+        if self.tp_rank == 0:
+            logger.warning(
+                "[VLLM_ASCEND_PD_TIMING_CONFIG] pid=%s log_every=%s",
+                os.getpid(),
+                self.timing_log_every,
+            )
 
     def _timing_enabled(self, req_id: str) -> bool:
+        external_req_id = get_external_request_id(req_id)
         return (
             self.tp_rank == 0
             and self.timing_log_every > 0
-            and int.from_bytes(hashlib.sha256(req_id.encode()).digest()[:8], "big") % self.timing_log_every == 0
+            and int.from_bytes(hashlib.sha256(external_req_id.encode()).digest()[:8], "big")
+            % self.timing_log_every
+            == 0
         )
 
     def run(self):
@@ -556,11 +565,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                         if req_meta.chunk_finish:
                             timing = self.transfer_timing.pop(req_id, None)
                             if timing is not None:
+                                external_req_id = get_external_request_id(req_id)
                                 logger.info(
                                     "[VLLM_ASCEND_PD_TRANSFER] request_id=%s bytes=%d "
                                     "transfer_window_ms=%.3f queue_wait_ms=%.3f "
                                     "prepare_wait_ms=%.3f mooncake_call_ms=%.3f layers=%d chunks=%d",
-                                    req_id,
+                                    external_req_id,
                                     timing["bytes"],
                                     (time.perf_counter() - timing["started_at"]) * 1000,
                                     timing["queue_wait_ms"],
