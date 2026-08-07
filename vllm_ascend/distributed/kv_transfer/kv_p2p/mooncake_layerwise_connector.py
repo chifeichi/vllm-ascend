@@ -143,6 +143,8 @@ class SendTask:
     group_block_len_tensor: list[torch.Tensor | None] | None = None
     group_seq_start_tensor: list[torch.Tensor | None] | None = None
     enqueued_at: float = 0.0
+    queue_depth_at_enqueue: int = 0
+    sender_snapshot_at_enqueue: tuple[float, float, float, int] | None = None
 
 
 @dataclass
@@ -268,6 +270,14 @@ class KVCacheSendingLayerThread(threading.Thread):
         except ValueError:
             self.timing_log_every = 0
         self.transfer_timing: dict[str, dict[str, float | int]] = {}
+        self._timing_lock = threading.Lock()
+        self._sender_busy_ms = 0.0
+        self._sender_mooncake_ms = 0.0
+        self._sender_event_wait_ms = 0.0
+        self._sender_tasks_completed = 0
+        self._sender_busy_started_at = 0.0
+        self._sender_mooncake_started_at = 0.0
+        self._sender_event_wait_started_at = 0.0
         if self.tp_rank == 0:
             logger.warning(
                 "[VLLM_ASCEND_PD_TIMING_CONFIG] pid=%s log_every=%s",
@@ -294,7 +304,25 @@ class KVCacheSendingLayerThread(threading.Thread):
             send_task = self.send_queue.get()
             self._handle_request(send_task)
 
+    def _sender_snapshot(self) -> tuple[float, float, float, int]:
+        now = time.perf_counter()
+        with self._timing_lock:
+            busy_ms = self._sender_busy_ms
+            mooncake_ms = self._sender_mooncake_ms
+            event_wait_ms = self._sender_event_wait_ms
+            if self._sender_busy_started_at:
+                busy_ms += (now - self._sender_busy_started_at) * 1000
+            if self._sender_mooncake_started_at:
+                mooncake_ms += (now - self._sender_mooncake_started_at) * 1000
+            if self._sender_event_wait_started_at:
+                event_wait_ms += (now - self._sender_event_wait_started_at) * 1000
+            return busy_ms, mooncake_ms, event_wait_ms, self._sender_tasks_completed
+
     def _handle_request(self, send_task: SendTask):
+        timing_enabled = self.timing_log_every > 0
+        if timing_enabled:
+            with self._timing_lock:
+                self._sender_busy_started_at = time.perf_counter()
         try:
             self._transfer_kv_cache(send_task)
         except Exception as e:
@@ -303,6 +331,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 send_task.layer_idx,
                 e,
             )
+        finally:
+            if timing_enabled:
+                now = time.perf_counter()
+                with self._timing_lock:
+                    self._sender_busy_ms += (now - self._sender_busy_started_at) * 1000
+                    self._sender_busy_started_at = 0.0
+                    self._sender_tasks_completed += 1
 
     def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
         src_list: list[int] = []
@@ -496,25 +531,45 @@ class KVCacheSendingLayerThread(threading.Thread):
             session_meta[session_id].length.extend(length_list)
             session_meta[session_id].req_ids.append(req_id)
 
-        if send_task.k_quant_cache is not None:
-            self.resharding_stream.synchronize()
-        elif self.pd_head_ratio == 1:
-            """
-            Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
-            This issue will be fixed in CANN version 8.5.rc1.
-            You can manually build the master branch of the project at https://gitcode.com/cann/hixl
-            to resolve this issue before the 8.5.RC1 release.
-            """
-            send_task.wait_event.synchronize()  # type:ignore
-        elif self.pd_head_ratio > 1:
-            self.resharding_stream.synchronize()
+        if self.timing_log_every > 0:
+            with self._timing_lock:
+                self._sender_event_wait_started_at = time.perf_counter()
+        try:
+            if send_task.k_quant_cache is not None:
+                self.resharding_stream.synchronize()
+            elif self.pd_head_ratio == 1:
+                """
+                Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
+                This issue will be fixed in CANN version 8.5.rc1.
+                You can manually build the master branch of the project at https://gitcode.com/cann/hixl
+                to resolve this issue before the 8.5.RC1 release.
+                """
+                send_task.wait_event.synchronize()  # type:ignore
+            elif self.pd_head_ratio > 1:
+                self.resharding_stream.synchronize()
+        finally:
+            if self.timing_log_every > 0:
+                now = time.perf_counter()
+                with self._timing_lock:
+                    self._sender_event_wait_ms += (now - self._sender_event_wait_started_at) * 1000
+                    self._sender_event_wait_started_at = 0.0
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 req_start_time = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
-                )
+                if self.timing_log_every > 0:
+                    with self._timing_lock:
+                        self._sender_mooncake_started_at = req_start_time
+                try:
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                    )
+                finally:
+                    req_end_time = time.perf_counter()
+                    if self.timing_log_every > 0:
+                        with self._timing_lock:
+                            self._sender_mooncake_ms += (req_end_time - self._sender_mooncake_started_at) * 1000
+                            self._sender_mooncake_started_at = 0.0
                 if ret < 0:
                     logger.error(
                         "Mooncake transfer failed for send requests. req_ids=%s, destination=%s, ret=%d. ",
@@ -524,7 +579,6 @@ class KVCacheSendingLayerThread(threading.Thread):
                     )
                     self.failed_reqs.add(req_id)
                 else:
-                    req_end_time = time.perf_counter()
                     total_transfer_size = sum(transfer_meta.length) / 1024
                     req_transfer_elapsed = (req_end_time - req_start_time) * 1000
                     logger.debug(
@@ -547,6 +601,16 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 "mooncake_call_ms": 0.0,
                                 "layers": 0,
                                 "chunks": 0,
+                                "first_queue_depth": send_task.queue_depth_at_enqueue,
+                                "max_queue_depth": send_task.queue_depth_at_enqueue,
+                                "batch_requests_sum": 0,
+                                "max_batch_requests": 0,
+                                "sender_busy_start_ms": (send_task.sender_snapshot_at_enqueue or (0, 0, 0, 0))[0],
+                                "sender_mooncake_start_ms": (send_task.sender_snapshot_at_enqueue or (0, 0, 0, 0))[1],
+                                "sender_event_wait_start_ms": (
+                                    send_task.sender_snapshot_at_enqueue or (0, 0, 0, 0)
+                                )[2],
+                                "sender_tasks_start": (send_task.sender_snapshot_at_enqueue or (0, 0, 0, 0))[3],
                             },
                         )
                         timing["bytes"] += request_transfer_bytes[req_id]
@@ -557,6 +621,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                         timing["prepare_wait_ms"] += (req_start_time - transfer_started_at) * 1000
                         timing["mooncake_call_ms"] += req_transfer_elapsed
                         timing["layers"] += 1
+                        timing["max_queue_depth"] = max(
+                            timing["max_queue_depth"], send_task.queue_depth_at_enqueue
+                        )
+                        timing["batch_requests_sum"] += len(send_task.send_request)
+                        timing["max_batch_requests"] = max(
+                            timing["max_batch_requests"], len(send_task.send_request)
+                        )
                         if send_task.layer_idx == (self.total_layers - 1):
                             timing["chunks"] += 1
                 if send_task.layer_idx == (self.total_layers - 1):
@@ -566,10 +637,23 @@ class KVCacheSendingLayerThread(threading.Thread):
                             timing = self.transfer_timing.pop(req_id, None)
                             if timing is not None:
                                 external_req_id = get_external_request_id(req_id)
+                                busy_ms, global_mooncake_ms, event_wait_ms, tasks_completed = self._sender_snapshot()
+                                sender_busy_ms = busy_ms - timing["sender_busy_start_ms"]
+                                sender_mooncake_ms = global_mooncake_ms - timing["sender_mooncake_start_ms"]
+                                sender_event_wait_ms = event_wait_ms - timing["sender_event_wait_start_ms"]
+                                sender_other_ms = max(
+                                    sender_busy_ms - sender_mooncake_ms - sender_event_wait_ms,
+                                    0.0,
+                                )
                                 logger.info(
-                                    "[VLLM_ASCEND_PD_TRANSFER] request_id=%s bytes=%d "
+                                    "[VLLM_ASCEND_PD_TRANSFER] pid=%s replica_rank=%s request_id=%s bytes=%d "
                                     "transfer_window_ms=%.3f queue_wait_ms=%.3f "
-                                    "prepare_wait_ms=%.3f mooncake_call_ms=%.3f layers=%d chunks=%d",
+                                    "prepare_wait_ms=%.3f mooncake_call_ms=%.3f layers=%d chunks=%d "
+                                    "first_queue_depth=%d max_queue_depth=%d sender_busy_ms=%.3f "
+                                    "sender_mooncake_ms=%.3f sender_event_wait_ms=%.3f sender_other_ms=%.3f "
+                                    "tasks_completed=%d avg_batch_requests=%.2f max_batch_requests=%d",
+                                    os.getpid(),
+                                    os.environ.get("VERL_REPLICA_RANK", "unknown"),
                                     external_req_id,
                                     timing["bytes"],
                                     (time.perf_counter() - timing["started_at"]) * 1000,
@@ -578,6 +662,15 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     timing["mooncake_call_ms"],
                                     timing["layers"],
                                     timing["chunks"],
+                                    timing["first_queue_depth"],
+                                    timing["max_queue_depth"],
+                                    sender_busy_ms,
+                                    sender_mooncake_ms,
+                                    sender_event_wait_ms,
+                                    sender_other_ms,
+                                    tasks_completed - timing["sender_tasks_start"],
+                                    timing["batch_requests_sum"] / max(timing["layers"], 1),
+                                    timing["max_batch_requests"],
                                 )
                             if req_id in self.failed_reqs:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
@@ -1888,6 +1981,8 @@ class MooncakeLayerwiseConnectorWorker:
 
             if self.kv_send_layer_thread.timing_log_every > 0:
                 layer_send_task.enqueued_at = time.perf_counter()
+                layer_send_task.queue_depth_at_enqueue = self.kv_send_layer_thread.send_queue.qsize()
+                layer_send_task.sender_snapshot_at_enqueue = self.kv_send_layer_thread._sender_snapshot()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 
