@@ -1,4 +1,24 @@
-grep '\[VLLM_ASCEND_PD_TRANSFER\]' <日志文件> \
-  | sed -E 's/.*transfer_window_ms=([^ ]+).*mooncake_call_ms=([^ ]+).*chunks=([0-9]+).*/\3 \1 \2/' \
-  | awk '{n[$1]++; w[$1]+=$2; m[$1]+=$3} END {for (k in n) printf "chunks=%s count=%d avg_window_ms=%.1f avg_mooncake_ms=%.1f\n",k,n[k],w[k]/n[k],m[k]/n[k]}' \
-  | sort
+awk '
+/VERL_PD_D_SCHEDULER/ {
+  rr=run=remote=sched=""
+  for (i=1; i<=NF; i++) {
+    split($i,a,"=")
+    if (a[1]=="replica_rank") rr=a[2]
+    if (a[1]=="running") run=a[2]
+    if (a[1]=="waiting_remote_kv") remote=a[2]
+    if (a[1]=="scheduled_reqs") sched=a[2]
+  }
+  n[rr]++
+  run_sum[rr]+=run
+  remote_sum[rr]+=remote
+  sched_sum[rr]+=sched
+  if (run==0) idle[rr]++
+  if (run==0 && remote>0) idle_remote[rr]++
+  if (run>run_max[rr]) run_max[rr]=run
+}
+END {
+  for (rr in n)
+    printf "replica=%s samples=%d avg_running=%.2f max_running=%d avg_scheduled=%.2f avg_remote_wait=%.2f idle_ratio=%.3f idle_remote_ratio=%.3f\n",
+      rr,n[rr],run_sum[rr]/n[rr],run_max[rr],sched_sum[rr]/n[rr],
+      remote_sum[rr]/n[rr],idle[rr]/n[rr],idle_remote[rr]/n[rr]
+}' <日志文件>
