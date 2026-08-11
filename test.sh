@@ -9,13 +9,22 @@ grep -a '\[ROLLOUT_SAMPLE\]' <运行日志> \
   | group_by(.instance_id)
   | map({
       instance_id: .[0].instance_id,
-      model_tokens: (map(.model_tokens) | add),
-      prompt_tokens: (map(.prompt_tokens) | add)
+      prompt_len: (map(.prompt_tokens) | add),
+      response_len: (map(.response_tokens) | add),
+      model_tokens: (map(.model_tokens) | add)
     })
   | sort_by(-.model_tokens)
-  | .[:64]
-  | .[].instance_id
-' > hard64_ids.txt
+  | .[:64] as $selected
+  | (["rank", "instance_id", "prompt_len", "response_len", "model_tokens"] | @tsv),
+    ($selected | to_entries[]
+      | [(.key + 1), .value.instance_id, .value.prompt_len,
+         .value.response_len, .value.model_tokens]
+      | @tsv)
+' | tee hard64_lengths.tsv
+
+
+awk -F '\t' 'NR > 1 {print $2}' hard64_lengths.tsv > hard64_ids.txt
+
 
 
 python3 -c 'import pandas as pd; ids=[x.strip() for x in open("hard64_ids.txt") if x.strip()]; rank={v:i for i,v in enumerate(ids)}; df=pd.read_parquet("<hard200.parquet>"); out=df[df["instance_id"].isin(rank)].copy(); out["_rank"]=out["instance_id"].map(rank); out.sort_values("_rank").drop(columns="_rank").to_parquet("swe_rebench_long_decode_64.parquet",index=False); print(len(out))'
