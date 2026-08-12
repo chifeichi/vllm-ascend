@@ -78,6 +78,9 @@ class KVPoolScheduler:
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
+        self.store_decode_kv = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "store_decode_kv", False
+        )
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
         self.client = LookupKeyClient(vllm_config)
         # request_id -> (vllm cached tokes, kvpool cached tokens)
@@ -356,6 +359,11 @@ class KVPoolScheduler:
         """
 
         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
+        save_decode_kv = (
+            self.kv_role == "kv_consumer"
+            and self.consumer_is_to_put
+            and self.store_decode_kv
+        )
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -471,16 +479,23 @@ class KVPoolScheduler:
                         raise ValueError(
                             f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached"
                         )
-                    num_computed_token = cached_reqs.num_computed_tokens[i]
-                    if num_computed_token >= len(request.prompt_token_ids):
+                    num_computed_tokens = cached_reqs.num_computed_tokens[i]
+                    if num_computed_tokens >= len(request.prompt_token_ids) and not save_decode_kv:
                         continue
                     request_tracker.update(new_block_ids)
 
-                    last_chunk_tokens_num = (
-                        self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))
-                        if self._discard_partial_chunks
-                        else len(request.prompt_token_ids)
-                    )
+                    if request_tracker.token_ids is not None:
+                        request_tracker.token_ids.extend(new_token_ids)
+                    if save_decode_kv:
+                        last_chunk_tokens_num = self._floor_to_cache_transfer_granularity(
+                            request_tracker.token_len
+                        )
+                    else:
+                        last_chunk_tokens_num = (
+                            self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))
+                            if self._discard_partial_chunks
+                            else len(request.prompt_token_ids)
+                        )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
                         self.cache_transfer_granularity,
