@@ -1,58 +1,32 @@
-grep -a '\[ROLLOUT_SAMPLE\]' <运行日志> \
-| sed 's/^.*\[ROLLOUT_SAMPLE\] //' \
-| jq -s -r '
-  map(select(
-    .instance_id != "" and
-    .claude_code_exit_code == 0 and
-    .found_eval_status == true
-  ))
-  | group_by(.instance_id)
-  | map({
-      instance_id: .[0].instance_id,
-      prompt_len: (map(.prompt_tokens) | add),
-      response_len: (map(.response_tokens) | add),
-      model_tokens: (map(.model_tokens) | add)
-    })
-  | sort_by(-.model_tokens)
-  | .[:64] as $selected
-  | (["rank", "instance_id", "prompt_len", "response_len", "model_tokens"] | @tsv),
-    ($selected | to_entries[]
-      | [(.key + 1), .value.instance_id, .value.prompt_len,
-         .value.response_len, .value.model_tokens]
-      | @tsv)
-' | tee hard64_lengths.tsv
-
-
-awk -F '\t' 'NR > 1 {print $2}' hard64_lengths.tsv > hard64_ids.txt
-
-
-
-python3 -c 'import pandas as pd; ids=[x.strip() for x in open("hard64_ids.txt") if x.strip()]; rank={v:i for i,v in enumerate(ids)}; df=pd.read_parquet("<hard200.parquet>"); out=df[df["instance_id"].isin(rank)].copy(); out["_rank"]=out["instance_id"].map(rank); out.sort_values("_rank").drop(columns="_rank").to_parquet("swe_rebench_long_decode_64.parquet",index=False); print(len(out))'
-
-python3 - <<'PY'
-import pandas as pd
-from filter_swe_rebench_hard import get_nested_metadata
-
-input_file = "<hard200.parquet>"
-output_file = "swe_rebench_long_decode_64.parquet"
-
-ids = [line.strip() for line in open("hard64_ids.txt") if line.strip()]
-rank = {instance_id: i for i, instance_id in enumerate(ids)}
-
-df = pd.read_parquet(input_file)
-
-if "instance_id" in df.columns:
-    instance_ids = df["instance_id"].astype(str)
-else:
-    instance_ids = (
-        df["extra_info"]
-        .map(get_nested_metadata)
-        .map(lambda metadata: str(metadata.get("instance_id", "")))
-    )
-
-selected = df[instance_ids.isin(rank)].copy()
-selected["_rank"] = instance_ids[selected.index].map(rank)
-selected = selected.sort_values("_rank").drop(columns="_rank")
-selected.to_parquet(output_file, index=False)
-
-print(f"selected={len(selected)} output={output_file}")
+grep "VERL_PD_SESSION_CACHE]" 1.log |
+awk '
+{
+  delete v
+  for (i=1; i<=NF; i++) {
+    split($i, a, "=")
+    v[a[1]]=a[2]
+  }
+  if (v["turn"] >= 2) {
+    n++
+    prompt += v["prompt_tokens"]
+    cached += v["p_cached_tokens"]
+    identical += v["identical_previous_tokens"]
+    prev_decode += v["previous_decode_tokens"]
+    identical_decode += v["identical_previous_decode_tokens"]
+    missing += v["missing_identical_tokens"]
+    missing_decode += v["missing_identical_decode_tokens"]
+  }
+}
+END {
+  print "samples=" n
+  print "avg_prompt=" prompt/n
+  print "avg_cached=" cached/n
+  print "avg_identical_previous=" identical/n
+  print "avg_previous_decode=" prev_decode/n
+  print "avg_identical_previous_decode=" identical_decode/n
+  print "avg_missing_identical=" missing/n
+  print "avg_missing_identical_decode=" missing_decode/n
+  print "actual_hit_rate=" 100*cached/prompt "%"
+  print "identical_prefix_ratio=" 100*identical/prompt "%"
+  print "missing_decode_share=" 100*missing_decode/missing "%"
+}'
