@@ -39,3 +39,5 @@ END {
   print "mm_changed=" mm_changed+0
   print "skip_prefix_read=" skip_prefix_read+0
 }'
+
+grep -Ei "GPU KV cache size|NPU KV cache size|KV cache size|number of tokens" 1.log | head
