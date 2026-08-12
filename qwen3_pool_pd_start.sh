@@ -16,10 +16,10 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-mooncake_master --port 50088 --eviction_high_watermark_ratio 0.9 --eviction_ratio 0.1 --default_kv_lease_ttl 11000 > mooncake_master.log 2>&1 &
+nohup mooncake_master --port 50088 --eviction_high_watermark_ratio 0.9 --eviction_ratio 0.1 --default_kv_lease_ttl 11000 > mooncake_master.log 2>&1 &
 MASTER_PID=$!
 
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python3 -m vllm.entrypoints.openai.api_server \
+nohup env ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
   --served-model-name qwen3 \
   --port 8001 \
@@ -58,7 +58,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python3 -m vllm.entrypoints.openai.api_server 
   }' > p.log 2>&1 &
 P_PID=$!
 
-ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python3 -m vllm.entrypoints.openai.api_server \
+nohup env ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
   --served-model-name qwen3 \
   --port 8002 \
@@ -108,7 +108,7 @@ until curl -sf http://127.0.0.1:8001/health >/dev/null && curl -sf http://127.0.
   sleep 5
 done
 
-python3 "$VLLM_ASCEND/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py" \
+nohup python3 "$VLLM_ASCEND/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py" \
   --host 0.0.0.0 \
   --port 8000 \
   --prefiller-hosts 127.0.0.1 \
@@ -117,5 +117,5 @@ python3 "$VLLM_ASCEND/examples/disaggregated_prefill_v1/load_balance_proxy_serve
   --decoder-ports 8002 > proxy.log 2>&1 &
 PROXY_PID=$!
 
-trap 'kill $PROXY_PID $P_PID $D_PID $MASTER_PID 2>/dev/null' EXIT INT TERM
-wait $PROXY_PID
+printf '%s\n' "$MASTER_PID" "$P_PID" "$D_PID" "$PROXY_PID" > qwen3_pool_pd.pids
+echo "master_pid=$MASTER_PID p_pid=$P_PID d_pid=$D_PID proxy_pid=$PROXY_PID"
