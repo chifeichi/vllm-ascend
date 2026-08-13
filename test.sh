@@ -1,4 +1,4 @@
-grep "VERL_PD_SESSION_CACHE]" 1.log |
+grep -a "VERL_PD_CACHE_FINISH" 1.log |
 awk '
 {
   delete v
@@ -6,23 +6,17 @@ awk '
     split($i,a,"=")
     v[a[1]]=a[2]
   }
-  if (v["turn"] >= 2) {
-    n++
-    prompt += v["prompt_tokens"]
-    cached += v["p_cached_tokens"]
-    identical += v["identical_previous_tokens"]
-    missing += v["missing_identical_tokens"]
-    missing_decode += v["missing_identical_decode_tokens"]
-  }
+  n++
+  total += v["total_tokens"]
+  retained += v["retained_hit_tokens_after_free"]
+  if (v["retained_hit_tokens_after_free"] == 0) zero++
+  if (v["hash_entries_after"] < v["hash_entries_before"]) shrunk++
 }
 END {
   print "samples=" n
-  print "avg_prompt=" prompt/n
-  print "avg_cached=" cached/n
-  print "avg_identical_previous=" identical/n
-  print "avg_missing_identical=" missing/n
-  print "avg_missing_identical_decode=" missing_decode/n
-  print "actual_hit_rate=" 100*cached/prompt "%"
-  print "identical_prefix_ratio=" 100*identical/prompt "%"
-  print "missing_decode_share=" 100*missing_decode/missing "%"
+  print "avg_total_tokens=" total/n
+  print "avg_retained_after_free=" retained/n
+  print "retained_ratio=" 100*retained/total "%"
+  print "zero_retained_count=" zero+0
+  print "hash_entries_shrunk_count=" shrunk+0
 }'
