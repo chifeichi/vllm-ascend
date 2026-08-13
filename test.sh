@@ -1,4 +1,4 @@
-grep "VERL_PD_CACHE_SCHED" 1.log |
+grep "VERL_PD_SESSION_CACHE]" 1.log |
 awk '
 {
   delete v
@@ -6,38 +6,23 @@ awk '
     split($i,a,"=")
     v[a[1]]=a[2]
   }
-
-  n++
-  session=v["session_id"]
-
-  if (session in last_first_hash && last_first_hash[session] != v["first_hash"])
-    first_hash_changed++
-
-  if (session in last_salt && last_salt[session] != v["cache_salt"])
-    cache_salt_changed++
-
-  if (session in last_lora && last_lora[session] != v["lora_id"])
-    lora_changed++
-
-  if (session in last_mm && last_mm[session] != v["mm_features"])
-    mm_changed++
-
-  if (v["skip_prefix_read"] != "False")
-    skip_prefix_read++
-
-  last_first_hash[session]=v["first_hash"]
-  last_salt[session]=v["cache_salt"]
-  last_lora[session]=v["lora_id"]
-  last_mm[session]=v["mm_features"]
+  if (v["turn"] >= 2) {
+    n++
+    prompt += v["prompt_tokens"]
+    cached += v["p_cached_tokens"]
+    identical += v["identical_previous_tokens"]
+    missing += v["missing_identical_tokens"]
+    missing_decode += v["missing_identical_decode_tokens"]
+  }
 }
 END {
   print "samples=" n
-  print "sessions=" length(last_first_hash)
-  print "first_hash_changed=" first_hash_changed+0
-  print "cache_salt_changed=" cache_salt_changed+0
-  print "lora_changed=" lora_changed+0
-  print "mm_changed=" mm_changed+0
-  print "skip_prefix_read=" skip_prefix_read+0
+  print "avg_prompt=" prompt/n
+  print "avg_cached=" cached/n
+  print "avg_identical_previous=" identical/n
+  print "avg_missing_identical=" missing/n
+  print "avg_missing_identical_decode=" missing_decode/n
+  print "actual_hit_rate=" 100*cached/prompt "%"
+  print "identical_prefix_ratio=" 100*identical/prompt "%"
+  print "missing_decode_share=" 100*missing_decode/missing "%"
 }'
-
-grep -Ei "GPU KV cache size|NPU KV cache size|KV cache size|number of tokens" 1.log | head
