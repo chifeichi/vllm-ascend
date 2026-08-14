@@ -89,8 +89,6 @@ nohup env ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python3 -m vllm.entrypoints.openai.a
         "kv_connector_extra_config":{
           "lookup_rpc_port":"1",
           "backend":"mooncake",
-          "consumer_is_to_put":true,
-          "store_decode_kv":true,
           "consumer_is_to_load":false,
           "load_async":false,
           "use_layerwise":false
