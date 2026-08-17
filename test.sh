@@ -1,6 +1,5 @@
-grep -a "MooncakeConnector finish req not in reqs to process" <日志文件> \
-| sed -nE 's/.*request_id=([^[:space:].,]+).*/\1/p' \
+grep -a "MooncakeConnector finish req not in reqs to process" <本次新日志文件> \
+| sed -nE 's/.*\(worker_tp([0-9]+) pid=([0-9]+)\).*/tp=\1 pid=\2/p' \
 | sort \
 | uniq -c \
-| awk '{count[$1]++} END {for (n in count) print "warnings_per_request=" n, "requests=" count[n]}' \
-| sort -n
+| sort -k2,2n
