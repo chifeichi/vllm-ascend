@@ -1638,6 +1638,35 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(worker._prefill_get_remote_rank("test"), [0, 1, 2, 3])
         worker._get_remote_ranks_for_req.assert_called_once_with("test")
 
+    def test_hybrid_remote_port_send_num_counts_all_decode_senders(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.tp_size = 4
+        worker._prefill_pp_size = 1
+        ranks_by_decode_tp = {
+            0: [0, 1],
+            1: [2, 3, 5],
+            2: [2, 4, 5],
+            3: [6, 7],
+        }
+        worker._get_hybrid_remote_rank_group_pulls = MagicMock(
+            side_effect=lambda _req_id, _prefill_tp_size, decode_tp_rank: (
+                ranks_by_decode_tp[decode_tp_rank],
+                {},
+            )
+        )
+        meta = types.SimpleNamespace(
+            remote_port=30000,
+            remote_host="127.0.0.1",
+            remote_multi_nodes_meta_mapping={},
+        )
+
+        send_num = worker._get_hybrid_remote_port_send_num("test", cast(ReqMeta, meta), 8)
+
+        self.assertEqual(
+            [send_num[30000 + rank]["num"] for rank in range(8)],
+            [1, 1, 2, 1, 1, 2, 1, 1],
+        )
+
     def test_get_kv_split_metadata(self):
         def get_kv_split_metadata(
             use_mla,

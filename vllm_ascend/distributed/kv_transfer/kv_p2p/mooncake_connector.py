@@ -2477,7 +2477,11 @@ class MooncakeConnectorWorker:
         self,
         req_id: str,
         prefill_tp_size: int,
+        decode_tp_rank: int | None = None,
     ) -> tuple[list[int], dict[int, list[GroupPull]]]:
+        if decode_tp_rank is None:
+            decode_tp_rank = self.tp_rank
+
         rank_group_pulls: OrderedDict[int, list[GroupPull]] = OrderedDict()
 
         def add_group_pull(remote_rank: int, group_pull: GroupPull) -> None:
@@ -2495,7 +2499,7 @@ class MooncakeConnectorWorker:
                 num_group_pulls = prefill_tp_size // self.tp_size
                 for pp_rank in range(self._prefill_pp_size):
                     pp_rank_offset = pp_rank * prefill_tp_size
-                    local_tp_offset = self.tp_rank * num_group_pulls
+                    local_tp_offset = decode_tp_rank * num_group_pulls
                     for remote_tp_offset in range(num_group_pulls):
                         remote_rank = pp_rank_offset + local_tp_offset + remote_tp_offset
                         add_group_pull(
@@ -2511,7 +2515,7 @@ class MooncakeConnectorWorker:
                 continue
 
             num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
-            chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
+            chosen_rank_list = self._get_remote_ranks_for_req(req_id, prefill_tp_size)[decode_tp_rank]
             assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
                 f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
                 f"and prefill pp size({self._prefill_pp_size})."
@@ -2530,6 +2534,30 @@ class MooncakeConnectorWorker:
                 )
 
         return list(rank_group_pulls), dict(rank_group_pulls)
+
+    def _get_hybrid_remote_port_send_num(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        prefill_tp_size: int,
+    ) -> dict[int, RemotePortInfo]:
+        remote_port_send_num: dict[int, RemotePortInfo] = {}
+        num_prefill_workers = prefill_tp_size * self._prefill_pp_size
+        for remote_rank in range(num_prefill_workers):
+            remote_host_info = meta.remote_multi_nodes_meta_mapping.get(str(remote_rank))
+            remote_host = meta.remote_host if remote_host_info is None else remote_host_info["host"]
+            remote_port_send_num[meta.remote_port + remote_rank] = {"num": 0, "host": remote_host}
+
+        for decode_tp_rank in range(self.tp_size):
+            remote_ranks, _ = self._get_hybrid_remote_rank_group_pulls(
+                req_id,
+                prefill_tp_size,
+                decode_tp_rank,
+            )
+            for remote_rank in remote_ranks:
+                remote_port_send_num[meta.remote_port + remote_rank]["num"] += 1
+
+        return remote_port_send_num
 
     def _get_attention_group_num_need_pulls(self, group_spec: dict[str, Any], prefill_tp_size: int) -> int:
         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
@@ -2579,6 +2607,16 @@ class MooncakeConnectorWorker:
                 prefill_tp_size,
                 meta.remote_port,
             )
+            if meta.remote_pcp_size * meta.remote_dcp_size > 1:
+                remote_port_send_num = self.remote_port_send_num[meta.remote_engine_id]
+            elif self._has_mamba_group():
+                remote_port_send_num = self._get_hybrid_remote_port_send_num(
+                    remote_req_id,
+                    meta,
+                    prefill_tp_size,
+                )
+            else:
+                remote_port_send_num = None
 
             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
                 for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
@@ -2589,11 +2627,6 @@ class MooncakeConnectorWorker:
                         meta.remote_host,
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
-                    )
-                    remote_port_send_num = (
-                        self.remote_port_send_num[meta.remote_engine_id]
-                        if meta.remote_pcp_size * meta.remote_dcp_size > 1
-                        else None
                     )
                     self.kv_recv_thread.add_request(
                         request_id=req_id,
