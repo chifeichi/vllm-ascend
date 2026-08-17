@@ -2653,6 +2653,15 @@ class MooncakeConnectorWorker:
         return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
 
     def _prefill_get_remote_rank(self, req_id: str) -> list[int]:
+        if any(
+            group_spec["kv_cache_spec_type"] == "MambaSpec" and layer_indices
+            for group_spec, layer_indices in self.kv_group2layeridx.values()
+        ):
+            # Each decode TP rank pulls its corresponding shard of the Mamba
+            # state. Collectively, the decode TP group reads from every
+            # prefill TP rank, even when attention KV-head replication means
+            # only a subset of prefill ranks is selected for attention KV.
+            return list(range(self._prefill_tp_size * self._prefill_pp_size))
         return sum(self._get_remote_ranks_for_req(req_id), [])
 
     def _get_remote_rank(self, req_id: str, prefill_tp_size: int | None = None) -> list[int]:

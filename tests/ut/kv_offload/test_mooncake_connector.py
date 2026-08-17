@@ -1613,6 +1613,31 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertListEqual(get_tp_rank(8, 1, 2, 4, 2, False, 4), get_tp_rank(4, 1, 2, 4, 2, False))
         self.assertListEqual(get_tp_rank(4, 1, 2, 4, 1, False, 2), get_tp_rank(2, 1, 2, 4, 1, False))
 
+    def test_prefill_get_remote_rank_for_hybrid_mamba(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker._prefill_tp_size = 8
+        worker._prefill_pp_size = 1
+        worker.kv_group2layeridx = {
+            0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [3, 7]),
+            1: ({"kv_cache_spec_type": "MambaSpec"}, [0, 1, 2]),
+        }
+        worker._get_remote_ranks_for_req = MagicMock(return_value=[[0], [2], [4], [6]])
+
+        self.assertEqual(worker._prefill_get_remote_rank("test"), list(range(8)))
+        worker._get_remote_ranks_for_req.assert_not_called()
+
+    def test_prefill_get_remote_rank_without_mamba(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker._prefill_tp_size = 4
+        worker._prefill_pp_size = 1
+        worker.kv_group2layeridx = {
+            0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0, 1]),
+        }
+        worker._get_remote_ranks_for_req = MagicMock(return_value=[[0, 1], [2, 3]])
+
+        self.assertEqual(worker._prefill_get_remote_rank("test"), [0, 1, 2, 3])
+        worker._get_remote_ranks_for_req.assert_called_once_with("test")
+
     def test_get_kv_split_metadata(self):
         def get_kv_split_metadata(
             use_mla,
