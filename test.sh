@@ -11,7 +11,7 @@ grep -a "VLLM_ASCEND_PD_TRANSFER" 1.log | awk '
           port=p[1]
           samples[port]++
           tasks[port]+=p[2]
-          bytes[port]+=p[3]
+          total_bytes[port]+=p[3]
           wait_sum[port]+=p[4]
           mooncake_sum[port]+=p[5]
         }
@@ -21,13 +21,16 @@ grep -a "VLLM_ASCEND_PD_TRANSFER" 1.log | awk '
 }
 END {
   for (port in samples) {
-    mib=bytes[port]/1024/1024
+    mib=total_bytes[port]/1024/1024
     seconds=mooncake_sum[port]/1000
+    throughput=0
+    if (seconds > 0)
+      throughput=mib/seconds
     printf "port=%s samples=%d tasks=%d avg_bytes_mb=%.2f avg_wait_ms=%.1f avg_mooncake_ms=%.1f effective_mb_s=%.1f\n",
       port, samples[port], tasks[port],
       mib/tasks[port],
       wait_sum[port]/samples[port],
       mooncake_sum[port]/tasks[port],
-      seconds>0 ? mib/seconds : 0
+      throughput
   }
 }'
