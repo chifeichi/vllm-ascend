@@ -3074,7 +3074,8 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker._prefill_tp_size = 8
         worker._is_hma_required = True
         send_counts = {31001: {"num": 2, "host": "localhost"}}
-        worker.remote_port_send_num = {"remote_engine": send_counts}
+        worker.remote_port_send_num = {}
+        worker._get_hybrid_remote_port_send_num = MagicMock(return_value=send_counts)
         worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(tuple(), tuple()))
         worker._get_kv_split_metadata = MagicMock(
             return_value=([[31001]], [([10], [20])], [([30], [40])])
@@ -3102,10 +3103,46 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
 
         worker.kv_recv_thread.add_request.assert_called_once()
+        worker._get_hybrid_remote_port_send_num.assert_called_once_with("remote_req", meta, 8)
         self.assertIs(
             worker.kv_recv_thread.add_request.call_args.kwargs["remote_port_send_num"],
             send_counts,
         )
+
+    def test_hybrid_remote_port_send_num_counts_all_decode_senders(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.tp_size = 4
+        worker._prefill_pp_size = 1
+        worker.vllm_config = self.vllm_config
+        ranks_by_decode_tp = {
+            0: [0, 1],
+            1: [2, 3, 5],
+            2: [2, 4, 5],
+            3: [6, 7],
+        }
+        worker._get_hybrid_remote_rank_group_pulls = MagicMock(
+            side_effect=lambda _req_id, _prefill_tp_size, decode_tp_rank: (
+                ranks_by_decode_tp[decode_tp_rank],
+                {},
+            )
+        )
+        worker._get_remote_host_info_by_port = MagicMock(
+            side_effect=lambda _base, port, host, engine_id, _mapping: (f"{host}-{port}", engine_id)
+        )
+        meta = types.SimpleNamespace(
+            remote_port=30000,
+            remote_host="127.0.0.1",
+            remote_engine_id="remote_engine",
+            remote_multi_nodes_meta_mapping={},
+        )
+
+        send_num = worker._get_hybrid_remote_port_send_num("test", cast(ReqMeta, meta), 8)
+
+        self.assertEqual(
+            [send_num[30000 + rank]["num"] for rank in range(8)],
+            [1, 1, 2, 1, 1, 2, 1, 1],
+        )
+        self.assertEqual(send_num[30007]["host"], "127.0.0.1-30007")
 
     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
         self.vllm_config.kv_transfer_config.kv_port = 30000
