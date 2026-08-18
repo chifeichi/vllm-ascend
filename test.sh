@@ -1,4 +1,20 @@
-grep '\[VLLM_ASCEND_PD_TRANSFER\]' <日志文件> \
-  | sed -E 's/.*transfer_window_ms=([^ ]+).*mooncake_call_ms=([^ ]+).*chunks=([0-9]+).*/\3 \1 \2/' \
-  | awk '{n[$1]++; w[$1]+=$2; m[$1]+=$3} END {for (k in n) printf "chunks=%s count=%d avg_window_ms=%.1f avg_mooncake_ms=%.1f\n",k,n[k],w[k]/n[k],m[k]/n[k]}' \
-  | sort
+grep -a "VLLM_ASCEND_PD_TRANSFER" 1.log | grep -v "status=completed" | head -n 1
+
+grep -a "VLLM_ASCEND_PD_TRANSFER" 1.log | awk '
+{
+  value=-1
+  for (i=1; i<=NF; i++) {
+    if ($i ~ /^transfer_window_ms=/) {
+      split($i, a, "=")
+      value=a[2]+0
+    }
+  }
+  if (value > max) {
+    max=value
+    line=$0
+  }
+}
+END {
+  print "max_transfer_window_ms=" max
+  print line
+}'
