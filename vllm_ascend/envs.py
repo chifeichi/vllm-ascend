@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Log one aggregated Mooncake PD transfer timing record every N completed
+    # requests per decode TP worker. 0 disables periodic timing logs. Transfer
+    # failures are always printed regardless of this setting. This variable
+    # contains no sensitive information.
+    "VLLM_ASCEND_PD_TRANSFER_LOG_EVERY": lambda: max(
+        0, int(os.getenv("VLLM_ASCEND_PD_TRANSFER_LOG_EVERY", "0"))
+    ),
 }
 
 # end-env-vars-definition

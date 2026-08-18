@@ -483,6 +483,42 @@ class TestCoreFunctionality(unittest.TestCase):
         cast(Any, self.thread.task_tracker).update_done_task_count.assert_called_once_with("req1")
         self.mock_queue.task_done.assert_called_once()
 
+    @patch("builtins.print")
+    def test_record_transfer_timing_aggregates_request_tasks(self, mock_print):
+        self.thread.transfer_log_every = 1
+        first_task = {
+            "remote_request_id": "req1",
+            "enqueue_time": 1.0,
+            "queue_depth_at_enqueue": 2,
+            "transfer_bytes": 100,
+            "prepare_ms": 2.0,
+            "mooncake_call_ms": 5.0,
+            "transfer_ret": 0,
+            "all_task_done": False,
+        }
+        last_task = {
+            "remote_request_id": "req1",
+            "enqueue_time": 1.1,
+            "queue_depth_at_enqueue": 3,
+            "transfer_bytes": 200,
+            "prepare_ms": 3.0,
+            "mooncake_call_ms": 7.0,
+            "transfer_ret": 0,
+            "all_task_done": True,
+        }
+
+        self.thread._record_transfer_timing(first_task, 1.2, 1.3, False, None)
+        self.thread._record_transfer_timing(last_task, 1.3, 1.5, False, None)
+
+        mock_print.assert_called_once()
+        message = mock_print.call_args.args[0]
+        self.assertIn("bytes=300", message)
+        self.assertIn("task_count=2", message)
+        self.assertIn("receiver_queue_wait_ms=200.000", message)
+        self.assertIn("mooncake_call_ms=12.000", message)
+        self.assertIn("status=completed", message)
+        self.assertNotIn("req1", self.thread.request_transfer_timings)
+
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_kv_cache(self, mock_get_meta):
         with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
