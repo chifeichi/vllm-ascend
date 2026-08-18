@@ -820,6 +820,7 @@ class KVCacheRecvingThread(threading.Thread):
                     "task_queue_wait_max_ms": 0.0,
                     "max_peer_queue_depth": 0,
                     "slowest_peer_port": -1,
+                    "peer_stats": {},
                     "failed": False,
                     "error_type": None,
                     "ret": 0,
@@ -844,6 +845,22 @@ class KVCacheRecvingThread(threading.Thread):
             if task_queue_wait_ms > timing["task_queue_wait_max_ms"]:
                 timing["task_queue_wait_max_ms"] = task_queue_wait_ms
                 timing["slowest_peer_port"] = req_meta.get("remote_handshake_port", -1)
+            peer_port = req_meta.get("remote_handshake_port", -1)
+            peer_stats = timing["peer_stats"].setdefault(
+                peer_port,
+                {
+                    "task_count": 0,
+                    "bytes": 0,
+                    "peer_queue_wait_max_ms": 0.0,
+                    "mooncake_call_ms": 0.0,
+                },
+            )
+            peer_stats["task_count"] += 1
+            peer_stats["bytes"] += req_meta.get("transfer_bytes", 0)
+            peer_stats["peer_queue_wait_max_ms"] = max(
+                peer_stats["peer_queue_wait_max_ms"], peer_queue_wait_ms
+            )
+            peer_stats["mooncake_call_ms"] += req_meta.get("mooncake_call_ms", 0.0)
             timing["failed"] = timing["failed"] or transfer_failed
             if error_type is not None:
                 timing["error_type"] = error_type
@@ -873,6 +890,11 @@ class KVCacheRecvingThread(threading.Thread):
             0.0,
             timing["busy_ms"] - timing["prepare_ms"] - timing["mooncake_call_ms"],
         )
+        peer_stats = ",".join(
+            f"{port}:{stats['task_count']}:{stats['bytes']}:"
+            f"{stats['peer_queue_wait_max_ms']:.3f}:{stats['mooncake_call_ms']:.3f}"
+            for port, stats in sorted(timing["peer_stats"].items())
+        )
         print(
             f"[VLLM_ASCEND_PD_TRANSFER] pid={os.getpid()} "
             f"engine_id={self.local_engine_id} dp_rank={self.dp_rank} "
@@ -890,6 +912,7 @@ class KVCacheRecvingThread(threading.Thread):
             f"queue_depth_at_enqueue={timing['max_queue_depth']} "
             f"peer_queue_depth_at_enqueue={timing['max_peer_queue_depth']} "
             f"slowest_peer_port={timing['slowest_peer_port']} "
+            f"peer_stats={peer_stats or 'none'} "
             f"queue_depth_at_finish={self.request_queue.qsize()} "
             f"status={'failed' if timing['failed'] else 'completed'} "
             f"ret={timing['ret']} error_type={timing['error_type']}",

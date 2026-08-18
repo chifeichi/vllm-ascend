@@ -930,6 +930,7 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertIn("task_queue_wait_max_ms=200.000", message)
         self.assertIn("peer_queue_depth_at_enqueue=4", message)
         self.assertIn("slowest_peer_port=6666", message)
+        self.assertIn("peer_stats=6666:1:100:100.000:5.000,7777:1:200:150.000:7.000", message)
         self.assertIn("mooncake_call_ms=12.000", message)
         self.assertIn("status=completed", message)
         self.assertNotIn("req1", self.thread.request_transfer_timings)
