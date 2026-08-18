@@ -535,6 +535,18 @@ class KVCacheRecvingThread(threading.Thread):
         self.failed_recv_requests: set[str] = set()
         self.invalid_block_ids: set[int] = set()
         self.failed_recv_requests_lock = threading.Lock()
+        self.transfer_log_every = ascend_envs.VLLM_ASCEND_PD_TRANSFER_LOG_EVERY
+        self.completed_transfer_requests = 0
+        self.request_transfer_timings: dict[str, dict[str, Any]] = {}
+        self.request_transfer_timings_lock = threading.Lock()
+        self.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        if self.transfer_log_every > 0:
+            print(
+                f"[VLLM_ASCEND_PD_TRANSFER_CONFIG] pid={os.getpid()} "
+                f"engine_id={self.local_engine_id} dp_rank={self.dp_rank} "
+                f"tp_rank={self.tp_rank} log_every={self.transfer_log_every}",
+                flush=True,
+            )
 
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
@@ -587,6 +599,8 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
             "shard_idx": shard_idx,
             "remote_block_size": remote_block_size,
+            "enqueue_time": time.perf_counter(),
+            "queue_depth_at_enqueue": self.request_queue.qsize(),
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
@@ -710,6 +724,12 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
         transfer_failed = self._is_failed_recv_request(request_id)
+        task_start_time = time.perf_counter()
+        req_meta["transfer_bytes"] = 0
+        req_meta["prepare_ms"] = 0.0
+        req_meta["mooncake_call_ms"] = 0.0
+        req_meta["transfer_ret"] = 0
+        error_type = None
 
         try:
             if transfer_failed:
@@ -722,6 +742,7 @@ class KVCacheRecvingThread(threading.Thread):
                     logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
                 except Exception as e:
                     transfer_failed = True
+                    error_type = type(e).__name__
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
                     logger.exception("Failed to transfer KV cache for request %s: %s", remote_request_id, e)
         finally:
@@ -747,12 +768,107 @@ class KVCacheRecvingThread(threading.Thread):
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
                 self._clear_failed_recv_request(request_id)
+            self._record_transfer_timing(
+                req_meta,
+                task_start_time,
+                time.perf_counter(),
+                transfer_failed,
+                error_type,
+                all_tasks_done,
+            )
             self.request_queue.task_done()
             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
             self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+
+    def _record_transfer_timing(
+        self,
+        req_meta: dict[str, Any],
+        task_start_time: float,
+        task_end_time: float,
+        transfer_failed: bool,
+        error_type: str | None,
+        request_complete: bool,
+    ) -> None:
+        remote_request_id = req_meta["remote_request_id"]
+        enqueue_time = req_meta.get("enqueue_time", task_start_time)
+        with self.request_transfer_timings_lock:
+            timing = self.request_transfer_timings.setdefault(
+                remote_request_id,
+                {
+                    "first_enqueue_time": enqueue_time,
+                    "first_task_start_time": task_start_time,
+                    "last_task_end_time": task_end_time,
+                    "busy_ms": 0.0,
+                    "prepare_ms": 0.0,
+                    "mooncake_call_ms": 0.0,
+                    "bytes": 0,
+                    "task_count": 0,
+                    "max_queue_depth": 0,
+                    "failed": False,
+                    "error_type": None,
+                    "ret": 0,
+                },
+            )
+            timing["first_enqueue_time"] = min(timing["first_enqueue_time"], enqueue_time)
+            timing["first_task_start_time"] = min(timing["first_task_start_time"], task_start_time)
+            timing["last_task_end_time"] = max(timing["last_task_end_time"], task_end_time)
+            timing["busy_ms"] += (task_end_time - task_start_time) * 1000
+            timing["prepare_ms"] += req_meta.get("prepare_ms", 0.0)
+            timing["mooncake_call_ms"] += req_meta.get("mooncake_call_ms", 0.0)
+            timing["bytes"] += req_meta.get("transfer_bytes", 0)
+            timing["task_count"] += 1
+            timing["max_queue_depth"] = max(
+                timing["max_queue_depth"], req_meta.get("queue_depth_at_enqueue", 0)
+            )
+            timing["failed"] = timing["failed"] or transfer_failed
+            if error_type is not None:
+                timing["error_type"] = error_type
+            if req_meta.get("transfer_ret", 0) < 0:
+                timing["ret"] = req_meta["transfer_ret"]
+
+            if not request_complete:
+                return
+
+            self.completed_transfer_requests += 1
+            should_log = (
+                self.transfer_log_every > 0
+                and self.completed_transfer_requests % self.transfer_log_every == 0
+            )
+            self.request_transfer_timings.pop(remote_request_id, None)
+
+        if not should_log and not timing["failed"]:
+            return
+
+        receiver_queue_wait_ms = (
+            timing["first_task_start_time"] - timing["first_enqueue_time"]
+        ) * 1000
+        transfer_window_ms = (
+            timing["last_task_end_time"] - timing["first_enqueue_time"]
+        ) * 1000
+        receiver_other_ms = max(
+            0.0,
+            timing["busy_ms"] - timing["prepare_ms"] - timing["mooncake_call_ms"],
+        )
+        print(
+            f"[VLLM_ASCEND_PD_TRANSFER] pid={os.getpid()} "
+            f"engine_id={self.local_engine_id} dp_rank={self.dp_rank} "
+            f"tp_rank={self.tp_rank} request_id={remote_request_id} "
+            f"bytes={timing['bytes']} task_count={timing['task_count']} "
+            f"transfer_window_ms={transfer_window_ms:.3f} "
+            f"receiver_queue_wait_ms={receiver_queue_wait_ms:.3f} "
+            f"receiver_busy_ms={timing['busy_ms']:.3f} "
+            f"prepare_ms={timing['prepare_ms']:.3f} "
+            f"mooncake_call_ms={timing['mooncake_call_ms']:.3f} "
+            f"receiver_other_ms={receiver_other_ms:.3f} "
+            f"queue_depth_at_enqueue={timing['max_queue_depth']} "
+            f"queue_depth_at_finish={self.request_queue.qsize()} "
+            f"status={'failed' if timing['failed'] else 'completed'} "
+            f"ret={timing['ret']} error_type={timing['error_type']}",
+            flush=True,
+        )
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -773,6 +889,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        prepare_start_time = time.perf_counter()
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -787,6 +904,7 @@ class KVCacheRecvingThread(threading.Thread):
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
         if num_local_blocks == 0 and not has_replicate_k_blocks:
+            req_meta["prepare_ms"] = (time.perf_counter() - prepare_start_time) * 1000
             return
 
         # Check if we have the remote metadata cached.
@@ -949,6 +1067,7 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
         if not src_list:
+            req_meta["prepare_ms"] = (time.perf_counter() - prepare_start_time) * 1000
             return
 
         logger.debug(
@@ -959,8 +1078,23 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
+        req_meta["transfer_bytes"] = sum(length_list)
+        req_meta["prepare_ms"] = (time.perf_counter() - prepare_start_time) * 1000
+        mooncake_call_start_time = time.perf_counter()
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        req_meta["mooncake_call_ms"] = (time.perf_counter() - mooncake_call_start_time) * 1000
+        req_meta["transfer_ret"] = ret
         if ret < 0:
+            print(
+                f"[VLLM_ASCEND_PD_TRANSFER_FAILURE] pid={os.getpid()} "
+                f"engine_id={self.local_engine_id} dp_rank={self.dp_rank} "
+                f"tp_rank={self.tp_rank} request_id={remote_request_id} "
+                f"remote_host={remote_host} remote_handshake_port={remote_handshake_port} "
+                f"remote_session_id={session_id} bytes={req_meta['transfer_bytes']} "
+                f"slice_count={len(length_list)} prepare_ms={req_meta['prepare_ms']:.3f} "
+                f"mooncake_call_ms={req_meta['mooncake_call_ms']:.3f} ret={ret}",
+                flush=True,
+            )
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
                 req_meta["remote_request_id"],
@@ -3428,7 +3562,7 @@ class MooncakeConnectorWorker:
                     )
                     remote_port_send_num = (
                         self.remote_port_send_num[meta.remote_engine_id]
-                        if meta.remote_pcp_size * meta.remote_dcp_size > 1
+                        if meta.remote_pcp_size * meta.remote_dcp_size > 1 or self._is_hma_required
                         else None
                     )
                     local_block_ids_replicate_k_for_port = (

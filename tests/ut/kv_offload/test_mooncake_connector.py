@@ -888,6 +888,41 @@ class TestCoreFunctionality(unittest.TestCase):
         cast(Any, self.thread.task_tracker).update_done_task_count.assert_called_once_with("req1")
         self.mock_queue.task_done.assert_called_once()
 
+    @patch("builtins.print")
+    def test_record_transfer_timing_aggregates_parallel_tasks(self, mock_print):
+        self.thread.transfer_log_every = 1
+        self.thread.request_queue.qsize.return_value = 1
+        first_task = {
+            "remote_request_id": "req1",
+            "enqueue_time": 1.0,
+            "queue_depth_at_enqueue": 2,
+            "transfer_bytes": 100,
+            "prepare_ms": 2.0,
+            "mooncake_call_ms": 5.0,
+            "transfer_ret": 0,
+        }
+        last_task = {
+            "remote_request_id": "req1",
+            "enqueue_time": 1.1,
+            "queue_depth_at_enqueue": 3,
+            "transfer_bytes": 200,
+            "prepare_ms": 3.0,
+            "mooncake_call_ms": 7.0,
+            "transfer_ret": 0,
+        }
+
+        self.thread._record_transfer_timing(first_task, 1.2, 1.3, False, None, False)
+        self.thread._record_transfer_timing(last_task, 1.3, 1.5, False, None, True)
+
+        mock_print.assert_called_once()
+        message = mock_print.call_args.args[0]
+        self.assertIn("bytes=300", message)
+        self.assertIn("task_count=2", message)
+        self.assertIn("receiver_queue_wait_ms=200.000", message)
+        self.assertIn("mooncake_call_ms=12.000", message)
+        self.assertIn("status=completed", message)
+        self.assertNotIn("req1", self.thread.request_transfer_timings)
+
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_kv_cache(self, mock_get_meta):
         with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
@@ -3031,6 +3066,46 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(add_request_calls[1].kwargs["remote_handshake_port"], 31003)
         self.assertIsNone(add_request_calls[1].kwargs["local_block_ids_replicate_k"])
         self.assertIsNone(add_request_calls[1].kwargs["remote_block_ids_replicate_k"])
+
+    def test_start_load_kv_passes_send_counts_for_hybrid_non_cp(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = MagicMock()
+        worker._prefill_tp_size = 8
+        worker._is_hma_required = True
+        send_counts = {31001: {"num": 2, "host": "localhost"}}
+        worker.remote_port_send_num = {"remote_engine": send_counts}
+        worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(tuple(), tuple()))
+        worker._get_kv_split_metadata = MagicMock(
+            return_value=([[31001]], [([10], [20])], [([30], [40])])
+        )
+        worker._get_group_pulls_metadata = MagicMock(
+            return_value=[[[GroupPull(group_id=0, remote_tp_offset=0, num_group_pulls=1)]]]
+        )
+        worker._get_remote_host_info_by_port = MagicMock(return_value=("localhost", "remote_engine"))
+        meta = types.SimpleNamespace(
+            remote_request_id="remote_req",
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_port=31000,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_ptp_size=8,
+            remote_multi_nodes_meta_mapping={},
+            remote_block_size=16,
+            local_block_ids=([10], [20]),
+            remote_block_ids=([30], [40]),
+            num_computed_tokens=0,
+        )
+        metadata = types.SimpleNamespace(reqs_in_batch=["req"], requests={"req": meta})
+
+        worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
+
+        worker.kv_recv_thread.add_request.assert_called_once()
+        self.assertIs(
+            worker.kv_recv_thread.add_request.call_args.kwargs["remote_port_send_num"],
+            send_counts,
+        )
 
     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
         self.vllm_config.kv_transfer_config.kv_port = 30000
