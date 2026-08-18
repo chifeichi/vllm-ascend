@@ -895,7 +895,10 @@ class TestCoreFunctionality(unittest.TestCase):
         first_task = {
             "remote_request_id": "req1",
             "enqueue_time": 1.0,
+            "dispatch_time": 1.1,
             "queue_depth_at_enqueue": 2,
+            "peer_queue_depth_at_enqueue": 1,
+            "remote_handshake_port": 6666,
             "transfer_bytes": 100,
             "prepare_ms": 2.0,
             "mooncake_call_ms": 5.0,
@@ -903,8 +906,11 @@ class TestCoreFunctionality(unittest.TestCase):
         }
         last_task = {
             "remote_request_id": "req1",
-            "enqueue_time": 1.1,
+            "enqueue_time": 1.12,
+            "dispatch_time": 1.15,
             "queue_depth_at_enqueue": 3,
+            "peer_queue_depth_at_enqueue": 4,
+            "remote_handshake_port": 7777,
             "transfer_bytes": 200,
             "prepare_ms": 3.0,
             "mooncake_call_ms": 7.0,
@@ -919,6 +925,11 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertIn("bytes=300", message)
         self.assertIn("task_count=2", message)
         self.assertIn("receiver_queue_wait_ms=200.000", message)
+        self.assertIn("dispatcher_wait_max_ms=100.000", message)
+        self.assertIn("peer_queue_wait_max_ms=150.000", message)
+        self.assertIn("task_queue_wait_max_ms=200.000", message)
+        self.assertIn("peer_queue_depth_at_enqueue=4", message)
+        self.assertIn("slowest_peer_port=6666", message)
         self.assertIn("mooncake_call_ms=12.000", message)
         self.assertIn("status=completed", message)
         self.assertNotIn("req1", self.thread.request_transfer_timings)

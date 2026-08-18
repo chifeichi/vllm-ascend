@@ -649,9 +649,13 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _submit_request(self, request_data: dict[str, Any]) -> None:
         peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
+        request_data["dispatch_time"] = time.perf_counter()
         self._mark_request_task_submitted(request_data)
         should_start_worker = False
         with self.peer_request_queues_lock:
+            request_data["peer_queue_depth_at_enqueue"] = len(self.peer_request_queues[peer_key]) + int(
+                peer_key in self.active_peer_request_handlers
+            )
             self.peer_request_queues[peer_key].append(request_data)
             if peer_key not in self.active_peer_request_handlers:
                 self.active_peer_request_handlers.add(peer_key)
@@ -794,6 +798,10 @@ class KVCacheRecvingThread(threading.Thread):
     ) -> None:
         remote_request_id = req_meta["remote_request_id"]
         enqueue_time = req_meta.get("enqueue_time", task_start_time)
+        dispatch_time = req_meta.get("dispatch_time", task_start_time)
+        dispatcher_wait_ms = max(0.0, (dispatch_time - enqueue_time) * 1000)
+        peer_queue_wait_ms = max(0.0, (task_start_time - dispatch_time) * 1000)
+        task_queue_wait_ms = max(0.0, (task_start_time - enqueue_time) * 1000)
         with self.request_transfer_timings_lock:
             timing = self.request_transfer_timings.setdefault(
                 remote_request_id,
@@ -807,6 +815,11 @@ class KVCacheRecvingThread(threading.Thread):
                     "bytes": 0,
                     "task_count": 0,
                     "max_queue_depth": 0,
+                    "dispatcher_wait_max_ms": 0.0,
+                    "peer_queue_wait_max_ms": 0.0,
+                    "task_queue_wait_max_ms": 0.0,
+                    "max_peer_queue_depth": 0,
+                    "slowest_peer_port": -1,
                     "failed": False,
                     "error_type": None,
                     "ret": 0,
@@ -823,6 +836,14 @@ class KVCacheRecvingThread(threading.Thread):
             timing["max_queue_depth"] = max(
                 timing["max_queue_depth"], req_meta.get("queue_depth_at_enqueue", 0)
             )
+            timing["dispatcher_wait_max_ms"] = max(timing["dispatcher_wait_max_ms"], dispatcher_wait_ms)
+            timing["peer_queue_wait_max_ms"] = max(timing["peer_queue_wait_max_ms"], peer_queue_wait_ms)
+            timing["max_peer_queue_depth"] = max(
+                timing["max_peer_queue_depth"], req_meta.get("peer_queue_depth_at_enqueue", 0)
+            )
+            if task_queue_wait_ms > timing["task_queue_wait_max_ms"]:
+                timing["task_queue_wait_max_ms"] = task_queue_wait_ms
+                timing["slowest_peer_port"] = req_meta.get("remote_handshake_port", -1)
             timing["failed"] = timing["failed"] or transfer_failed
             if error_type is not None:
                 timing["error_type"] = error_type
@@ -859,11 +880,16 @@ class KVCacheRecvingThread(threading.Thread):
             f"bytes={timing['bytes']} task_count={timing['task_count']} "
             f"transfer_window_ms={transfer_window_ms:.3f} "
             f"receiver_queue_wait_ms={receiver_queue_wait_ms:.3f} "
+            f"dispatcher_wait_max_ms={timing['dispatcher_wait_max_ms']:.3f} "
+            f"peer_queue_wait_max_ms={timing['peer_queue_wait_max_ms']:.3f} "
+            f"task_queue_wait_max_ms={timing['task_queue_wait_max_ms']:.3f} "
             f"receiver_busy_ms={timing['busy_ms']:.3f} "
             f"prepare_ms={timing['prepare_ms']:.3f} "
             f"mooncake_call_ms={timing['mooncake_call_ms']:.3f} "
             f"receiver_other_ms={receiver_other_ms:.3f} "
             f"queue_depth_at_enqueue={timing['max_queue_depth']} "
+            f"peer_queue_depth_at_enqueue={timing['max_peer_queue_depth']} "
+            f"slowest_peer_port={timing['slowest_peer_port']} "
             f"queue_depth_at_finish={self.request_queue.qsize()} "
             f"status={'failed' if timing['failed'] else 'completed'} "
             f"ret={timing['ret']} error_type={timing['error_type']}",
