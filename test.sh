@@ -5,6 +5,6 @@ print(Path(mindspeed.__file__).parent)
 PY
 )"
 
-grep -Rns --include='*.py' \
-  'fused_permute_with_probs' \
-  "$MS_DIR" | head -n 30
+grep -RnsE --include='*.py' \
+  'permute_with_probs|moe_token_permute|fused_permute|HAVE_TE' \
+  "$MS_DIR" | head -n 50
