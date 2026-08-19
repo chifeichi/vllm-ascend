@@ -1,6 +1,7 @@
 python - <<'PY'
-import importlib.metadata as md
-for d in md.distributions():
-    if (d.metadata.get("Name") or "").lower().replace("_", "-") == "megatron-core":
-        print(d.version, d._path)
+import site
+from pathlib import Path
+for root in site.getsitepackages():
+    for p in Path(root).glob("*megatron_core*"):
+        print(p)
 PY
