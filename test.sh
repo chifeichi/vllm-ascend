@@ -1,10 +1,10 @@
-MS_DIR="$(python - <<'PY'
-import mindspeed
-from pathlib import Path
-print(Path(mindspeed.__file__).parent)
-PY
-)"
+python - <<'PY'
+import importlib.metadata as md
+import megatron
 
-grep -RnsE --include='*.py' \
-  'permute_with_probs|moe_token_permute|fused_permute|HAVE_TE' \
-  "$MS_DIR" | head -n 50
+for dist in md.distributions():
+    if (dist.metadata.get("Name") or "").lower().replace("_", "-") == "megatron-core":
+        print("distribution:", dist.version, dist._path)
+
+print("megatron paths:", list(megatron.__path__))
+PY
