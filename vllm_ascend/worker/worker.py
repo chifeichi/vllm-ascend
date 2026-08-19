@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from types import NoneType
 
 import torch
@@ -46,6 +47,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
@@ -910,6 +912,41 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
+            if get_tp_group().rank_in_group == 0:
+                kv_cache_bytes = sum(
+                    tensor.size for tensor in kv_cache_config.kv_cache_tensors
+                )
+                block_sizes = sorted(
+                    {
+                        group.kv_cache_spec.block_size
+                        for group in kv_cache_config.kv_cache_groups
+                    }
+                )
+                max_model_len = self.vllm_config.model_config.max_model_len
+                max_concurrency = (
+                    get_max_concurrency_for_kv_cache_config(self.vllm_config, kv_cache_config)
+                    if kv_cache_config.kv_cache_groups
+                    else 0.0
+                )
+                token_capacity = int(max_concurrency * max_model_len)
+                print(
+                    "[VLLM_ASCEND_KV_CACHE_CAPACITY] "
+                    f"pid={os.getpid()} "
+                    f"replica_rank={os.getenv('VERL_REPLICA_RANK', '-1')} "
+                    f"pd_role={os.getenv('VERL_PD_ROLE', 'unified')} "
+                    f"pd_index={os.getenv('VERL_PD_INDEX', '-1')} "
+                    f"tp_rank={get_tp_group().rank_in_group} "
+                    f"num_blocks={kv_cache_config.num_blocks} "
+                    f"block_sizes={block_sizes} "
+                    f"kv_cache_bytes={kv_cache_bytes} "
+                    f"kv_cache_gib={kv_cache_bytes / GiB_bytes:.3f} "
+                    f"token_capacity={token_capacity} "
+                    f"max_model_len={max_model_len} "
+                    f"max_concurrency={max_concurrency:.3f} "
+                    f"gpu_memory_utilization={self.cache_config.gpu_memory_utilization}",
+                    flush=True,
+                )
 
             # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).
             #
