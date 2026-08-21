@@ -146,25 +146,13 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def rank_samples(
-    summary: pd.DataFrame,
-    min_sessions: int,
-) -> pd.DataFrame:
-    result = summary.copy()
-    result["eligible"] = result["sessions"] >= min_sessions
-    eligible = result[result["eligible"]].copy()
-    if eligible.empty:
-        raise ValueError(f"No eligible instances with at least {min_sessions} sessions")
-
-    ranked = eligible.sort_values(
+def rank_samples(summary: pd.DataFrame) -> pd.DataFrame:
+    ranked = summary.sort_values(
         ["response_prompt_ratio_of_means", "response_tokens_mean"],
         ascending=[False, False],
     ).reset_index(drop=True)
-    ineligible = result[~result["eligible"]].copy()
-    result = pd.concat([ranked, ineligible], ignore_index=True)
-    result["rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
-    result.loc[result["eligible"], "rank"] = range(1, int(result["eligible"].sum()) + 1)
-    return result
+    ranked["rank"] = range(1, len(ranked) + 1)
+    return ranked
 
 
 def main() -> None:
@@ -176,7 +164,6 @@ def main() -> None:
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
-    parser.add_argument("--min-sessions", type=int, default=1)
     args = parser.parse_args()
 
     dataset = pd.read_parquet(args.input)
@@ -203,14 +190,11 @@ def main() -> None:
             "No ROLLOUT_SAMPLE records match instance_id values in the input parquet"
         )
 
-    summary = rank_samples(
-        summarize(records),
-        args.min_sessions,
-    )
-    selected_summary = summary[summary["eligible"]].head(args.num_samples).copy()
+    summary = rank_samples(summarize(records))
+    selected_summary = summary.head(args.num_samples).copy()
     if len(selected_summary) < args.num_samples:
         raise ValueError(
-            f"Only {len(selected_summary)} eligible instances from the input parquet, "
+            f"Only {len(selected_summary)} logged instances from the input parquet, "
             f"fewer than --num-samples={args.num_samples}"
         )
     summary["selected"] = summary["rank"].isin(selected_summary["rank"])
@@ -225,12 +209,22 @@ def main() -> None:
     selected.to_parquet(args.output, index=False)
     summary.to_csv(args.report, index=False)
 
+    missing_logged_ids = sorted(input_ids - set(records["instance_id"]))
+    prompt_mean = float(records["prompt_tokens"].mean())
+    response_mean = float(records["response_tokens"].mean())
     print(f"ROLLOUT_SAMPLE records: {len(all_records)}")
     print(f"Matched records: {len(records)}")
     print(f"Ignored records outside input parquet: {ignored_records}")
     print(f"Ignored instances outside input parquet: {ignored_instances}")
-    print(f"Logged instances: {len(summary)}")
-    print(f"Eligible instances: {int(summary['eligible'].sum())}")
+    print(f"Logged sessions: {records['session_id'].nunique() if 'session_id' in records else len(records)}")
+    print(f"Candidate instances: {len(summary)}")
+    print(f"Input instances without logs: {len(missing_logged_ids)}")
+    if missing_logged_ids:
+        print(f"Missing instance_id values: {missing_logged_ids}")
+    print(f"All-record prompt mean: {prompt_mean:.3f}")
+    print(f"All-record response mean: {response_mean:.3f}")
+    print(f"All-record response/prompt ratio: {response_mean / max(prompt_mean, 1.0):.6f}")
+    print(f"Highest instance response/prompt ratio: {summary.iloc[0]['response_prompt_ratio_of_means']:.6f}")
     print(f"Selected instances: {len(selected_summary)}")
     print(f"Output parquet: {args.output}")
     print(f"Selection report: {args.report}")
@@ -254,5 +248,4 @@ if __name__ == "__main__":
 #   --input swe_rebench_hard200.parquet \
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
-#   --num-samples 64 \
-#   --min-sessions 1
+#   --num-samples 64
