@@ -113,10 +113,12 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
         ratio = group["response_prompt_ratio"]
         prompt_mean = float(group["prompt_tokens"].mean())
         response_mean = float(group["response_tokens"].mean())
+        sessions = int(group["session_id"].nunique()) if "session_id" in group else len(group)
         rows.append(
             {
                 "instance_id": str(instance_id),
-                "rollouts": len(group),
+                "sessions": sessions,
+                "trajectory_records": len(group),
                 "prompt_tokens_p25": float(group["prompt_tokens"].quantile(0.25)),
                 "prompt_tokens_p50": float(group["prompt_tokens"].median()),
                 "prompt_tokens_mean": prompt_mean,
@@ -146,13 +148,13 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
 
 def rank_samples(
     summary: pd.DataFrame,
-    min_rollouts: int,
+    min_sessions: int,
 ) -> pd.DataFrame:
     result = summary.copy()
-    result["eligible"] = result["rollouts"] >= min_rollouts
+    result["eligible"] = result["sessions"] >= min_sessions
     eligible = result[result["eligible"]].copy()
     if eligible.empty:
-        raise ValueError(f"No eligible instances with at least {min_rollouts} rollouts")
+        raise ValueError(f"No eligible instances with at least {min_sessions} sessions")
 
     ranked = eligible.sort_values(
         ["response_prompt_ratio_of_means", "response_tokens_mean"],
@@ -174,7 +176,7 @@ def main() -> None:
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
-    parser.add_argument("--min-rollouts", type=int, default=4)
+    parser.add_argument("--min-sessions", type=int, default=1)
     args = parser.parse_args()
 
     dataset = pd.read_parquet(args.input)
@@ -203,7 +205,7 @@ def main() -> None:
 
     summary = rank_samples(
         summarize(records),
-        args.min_rollouts,
+        args.min_sessions,
     )
     selected_summary = summary[summary["eligible"]].head(args.num_samples).copy()
     if len(selected_summary) < args.num_samples:
@@ -235,7 +237,8 @@ def main() -> None:
     for row in selected_summary.itertuples(index=False):
         print(
             f"rank={row.rank} instance_id={row.instance_id} "
-            f"rollouts={row.rollouts} turns_p50={row.num_turns_p50:.1f} "
+            f"sessions={row.sessions} trajectories={row.trajectory_records} "
+            f"turns_p50={row.num_turns_p50:.1f} "
             f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
             f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
@@ -252,4 +255,4 @@ if __name__ == "__main__":
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
 #   --num-samples 64 \
-#   --min-rollouts 4
+#   --min-sessions 1
