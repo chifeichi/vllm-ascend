@@ -111,17 +111,21 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for instance_id, group in records.groupby("instance_id", sort=False):
         ratio = group["response_prompt_ratio"]
+        prompt_mean = float(group["prompt_tokens"].mean())
+        response_mean = float(group["response_tokens"].mean())
         rows.append(
             {
                 "instance_id": str(instance_id),
                 "rollouts": len(group),
                 "prompt_tokens_p25": float(group["prompt_tokens"].quantile(0.25)),
                 "prompt_tokens_p50": float(group["prompt_tokens"].median()),
+                "prompt_tokens_mean": prompt_mean,
                 "response_tokens_min": float(group["response_tokens"].min()),
                 "response_tokens_p25": float(group["response_tokens"].quantile(0.25)),
                 "response_tokens_p50": float(group["response_tokens"].median()),
-                "response_tokens_mean": float(group["response_tokens"].mean()),
+                "response_tokens_mean": response_mean,
                 "response_tokens_max": float(group["response_tokens"].max()),
+                "response_prompt_ratio_of_means": response_mean / max(prompt_mean, 1.0),
                 "response_prompt_ratio_min": float(ratio.min()),
                 "response_prompt_ratio_p25": float(ratio.quantile(0.25)),
                 "response_prompt_ratio_p50": float(ratio.median()),
@@ -143,37 +147,18 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
 def rank_samples(
     summary: pd.DataFrame,
     min_rollouts: int,
-    ratio_tolerance: float,
 ) -> pd.DataFrame:
     result = summary.copy()
     result["eligible"] = result["rollouts"] >= min_rollouts
     eligible = result[result["eligible"]].copy()
     if eligible.empty:
-        raise ValueError("No eligible instances; lower --min-rollouts")
+        raise ValueError(f"No eligible instances with at least {min_rollouts} rollouts")
 
-    ranked_groups = []
-    ratio_tier = 1
-    while not eligible.empty:
-        best_ratio = float(eligible["response_prompt_ratio_p25"].max())
-        cutoff = best_ratio * (1.0 - ratio_tolerance)
-        near_ratio = eligible[eligible["response_prompt_ratio_p25"] >= cutoff].copy()
-        near_ratio["ratio_tier"] = ratio_tier
-        near_ratio = near_ratio.sort_values(
-            [
-                "response_tokens_p25",
-                "response_prompt_ratio_p25",
-                "response_prompt_ratio_p50",
-                "response_prompt_ratio_min",
-            ],
-            ascending=[False, False, False, False],
-        )
-        ranked_groups.append(near_ratio)
-        eligible = eligible.drop(index=near_ratio.index)
-        ratio_tier += 1
-
-    ranked = pd.concat(ranked_groups, ignore_index=True)
+    ranked = eligible.sort_values(
+        ["response_prompt_ratio_of_means", "response_tokens_mean"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
     ineligible = result[~result["eligible"]].copy()
-    ineligible["ratio_tier"] = pd.NA
     result = pd.concat([ranked, ineligible], ignore_index=True)
     result["rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
     result.loc[result["eligible"], "rank"] = range(1, int(result["eligible"].sum()) + 1)
@@ -190,10 +175,7 @@ def main() -> None:
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
     parser.add_argument("--min-rollouts", type=int, default=4)
-    parser.add_argument("--ratio-tolerance", type=float, default=0.05)
     args = parser.parse_args()
-    if not 0 <= args.ratio_tolerance < 1:
-        parser.error("--ratio-tolerance must be in [0, 1)")
 
     dataset = pd.read_parquet(args.input)
     ids = dataset.apply(dataset_instance_id, axis=1)
@@ -222,7 +204,6 @@ def main() -> None:
     summary = rank_samples(
         summarize(records),
         args.min_rollouts,
-        args.ratio_tolerance,
     )
     selected_summary = summary[summary["eligible"]].head(args.num_samples).copy()
     if len(selected_summary) < args.num_samples:
@@ -253,13 +234,10 @@ def main() -> None:
     print(f"Selection report: {args.report}")
     for row in selected_summary.itertuples(index=False):
         print(
-            f"rank={row.rank} ratio_tier={row.ratio_tier} instance_id={row.instance_id} "
+            f"rank={row.rank} instance_id={row.instance_id} "
             f"rollouts={row.rollouts} turns_p50={row.num_turns_p50:.1f} "
-            f"prompt_p50={row.prompt_tokens_p50:.0f} response_p25={row.response_tokens_p25:.0f} "
-            f"response_p50={row.response_tokens_p50:.0f} "
-            f"ratio_min={row.response_prompt_ratio_min:.3f} "
-            f"ratio_p25={row.response_prompt_ratio_p25:.3f} "
-            f"ratio_p50={row.response_prompt_ratio_p50:.3f} "
+            f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
+            f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
         )
 
@@ -274,5 +252,4 @@ if __name__ == "__main__":
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
 #   --num-samples 64 \
-#   --min-rollouts 4 \
-#   --ratio-tolerance 0.05
+#   --min-rollouts 4
