@@ -442,6 +442,15 @@ def main() -> None:
     prompt_mean = float(records["prompt_tokens"].mean())
     response_mean = float(records["response_tokens"].mean())
     model_mean = float(records["model_tokens"].mean())
+    selected_ids = set(selected_summary["instance_id"])
+    selected_records = records[records["instance_id"].isin(selected_ids)]
+    selected_prompt_total = float(selected_records["prompt_tokens"].sum())
+    selected_response_total = float(selected_records["response_tokens"].sum())
+    selected_model_total = float(selected_records["model_tokens"].sum())
+    selected_prompt_mean = float(selected_records["prompt_tokens"].mean())
+    selected_response_mean = float(selected_records["response_tokens"].mean())
+    selected_model_mean = float(selected_records["model_tokens"].mean())
+    selected_response_prompt_ratio = selected_response_total / max(selected_prompt_total, 1.0)
     print(f"ROLLOUT_SAMPLE records: {len(all_records)}")
     print(f"Matched records: {len(records)}")
     print(f"Ignored records outside input parquet: {ignored_records}")
@@ -492,6 +501,17 @@ def main() -> None:
         f"{summary['response_prompt_ratio_of_means'].max():.6f}"
     )
     print(f"Selected instances: {len(selected_summary)}")
+    print(f"Selected ROLLOUT_SAMPLE records: {len(selected_records)}")
+    print(f"Selected prompt total: {selected_prompt_total:.0f}")
+    print(f"Selected response total: {selected_response_total:.0f}")
+    print(f"Selected model-token total: {selected_model_total:.0f}")
+    print(f"Selected prompt mean: {selected_prompt_mean:.3f}")
+    print(f"Selected response mean: {selected_response_mean:.3f}")
+    print(f"Selected model-token mean: {selected_model_mean:.3f}")
+    print(
+        "Selected aggregate response:prompt ratio: "
+        f"{selected_response_prompt_ratio:.6f}:1"
+    )
     print(f"Output parquet: {args.output}")
     print(f"Selection report: {args.report}")
     for row in selected_summary.itertuples(index=False):
@@ -509,7 +529,7 @@ def main() -> None:
             f"context_p75={row.final_context_tokens_p75:.0f} "
             f"total_work={row.total_work_proxy_mean:.0f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
-            f"pd_score={row.pd_suitability_score:.3f} "
+            f"pd_suitability_score={row.pd_suitability_score:.3f} "
             f"response_prompt_ratio_mean={row.response_prompt_ratio_of_means:.3f} "
             f"response_prompt_ratio_p25={row.response_prompt_ratio_p25:.3f} "
             f"model_prompt_ratio_mean={row.model_prompt_ratio_of_means:.3f} "
