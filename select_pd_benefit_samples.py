@@ -240,40 +240,32 @@ def rank_samples(
     max_turns_mean: float | None,
 ) -> pd.DataFrame:
     result = summary.copy()
-    result["stable_model_per_turn_percentile"] = result["model_tokens_per_turn_p25"].rank(
+    result["stable_decode_p_work_percentile"] = result["decode_pressure_proxy_p25"].rank(
         method="average", pct=True, ascending=True
     )
-    result["stable_model_share_percentile"] = result["model_response_share_p25"].rank(
+    result["stable_model_per_turn_percentile"] = result["model_tokens_per_turn_p25"].rank(
         method="average", pct=True, ascending=True
     )
     result["stable_model_tokens_percentile"] = result["model_tokens_p25"].rank(
         method="average", pct=True, ascending=True
     )
-    result["stable_decode_pressure_percentile"] = result[
-        "decode_pressure_proxy_p25"
-    ].rank(method="average", pct=True, ascending=True)
-    result["p_cache_headroom_percentile"] = 1.0 - result["p_work_proxy_p75"].rank(
-        method="average", pct=True, ascending=True
-    )
-    result["low_turns_percentile"] = 1.0 - result["num_turns_p75"].rank(
+    result["low_final_context_percentile"] = 1.0 - result["final_context_tokens_p75"].rank(
         method="average", pct=True, ascending=True
     )
     result["stable_rollouts_percentile"] = 1.0 - result["model_tokens_per_turn_cv"].rank(
         method="average", pct=True, ascending=True
     )
 
-    # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  The
-    # score therefore balances a stable, long model generation per turn against
-    # the P-side work/cache footprint needed to produce it.  In particular,
-    # high model_tokens_per_turn alone must not let a long-prompt sample rank at
-    # the top when model output is small relative to P work.
+    # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  This
+    # score balances stable D-side work against estimated P-side recomputation
+    # and prefix-cache footprint.  Cache/tail eligibility below remains a hard
+    # guardrail; the score also continuously prefers smaller final contexts.
     result["pd_suitability_score"] = (
-        0.35 * result["stable_model_per_turn_percentile"]
-        + 0.25 * result["stable_decode_pressure_percentile"]
-        + 0.20 * result["p_cache_headroom_percentile"]
-        + 0.10 * result["stable_model_share_percentile"]
-        + 0.05 * result["low_turns_percentile"]
-        + 0.05 * result["stable_rollouts_percentile"]
+        0.40 * result["stable_decode_p_work_percentile"]
+        + 0.25 * result["stable_model_per_turn_percentile"]
+        + 0.15 * result["stable_model_tokens_percentile"]
+        + 0.10 * result["low_final_context_percentile"]
+        + 0.10 * result["stable_rollouts_percentile"]
     )
     result["pd_score_rank_all"] = result["pd_suitability_score"].rank(
         method="min", ascending=False
@@ -324,10 +316,10 @@ def rank_samples(
 
     sort_columns = [
         "pd_suitability_score",
+        "decode_pressure_proxy_p25",
         "model_tokens_per_turn_p25",
-        "model_response_share_p25",
         "model_tokens_p25",
-        "num_turns_mean",
+        "final_context_tokens_p75",
     ]
     ascending = [False, False, False, False, True]
     eligible = result[result["selection_eligible"]].sort_values(
@@ -584,6 +576,11 @@ def main() -> None:
                     f"instance_id={row.instance_id} "
                     f"pd_suitability_score={row.pd_suitability_score:.6f} "
                     f"score_rank_all={row.pd_score_rank_all}/{len(summary)} "
+                    f"model_p25={row.model_tokens_p25:.0f} "
+                    f"model_per_turn_p25={row.model_tokens_per_turn_p25:.0f} "
+                    f"p_work_p75={row.p_work_proxy_p75:.0f} "
+                    f"decode_p_work_p25={row.decode_pressure_proxy_p25:.3f} "
+                    f"context_p75={row.final_context_tokens_p75:.0f} "
                     f"eligible_rank={current_rank} "
                     f"selection_eligible={row.selection_eligible} "
                     f"selected_now={row.selected} "
@@ -607,8 +604,13 @@ def main() -> None:
             f"total_work={row.total_work_proxy_mean:.0f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
             f"decode_pressure_p25={row.decode_pressure_proxy_p25:.3f} "
-            f"p_cache_headroom_percentile={row.p_cache_headroom_percentile:.3f} "
             f"pd_suitability_score={row.pd_suitability_score:.3f} "
+            f"score_parts="
+            f"ratio:{row.stable_decode_p_work_percentile:.3f},"
+            f"per_turn:{row.stable_model_per_turn_percentile:.3f},"
+            f"model:{row.stable_model_tokens_percentile:.3f},"
+            f"low_context:{row.low_final_context_percentile:.3f},"
+            f"stability:{row.stable_rollouts_percentile:.3f} "
             f"response_prompt_ratio_mean={row.response_prompt_ratio_of_means:.3f} "
             f"response_prompt_ratio_p25={row.response_prompt_ratio_p25:.3f} "
             f"model_prompt_ratio_mean={row.model_prompt_ratio_of_means:.3f} "
