@@ -113,6 +113,7 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
         ratio = group["response_prompt_ratio"]
         prompt_mean = float(group["prompt_tokens"].mean())
         response_mean = float(group["response_tokens"].mean())
+        turns_mean = float(group["num_turns"].mean())
         sessions = int(group["session_id"].nunique()) if "session_id" in group else len(group)
         rows.append(
             {
@@ -134,8 +135,10 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "response_prompt_ratio_mean": float(ratio.mean()),
                 "response_prompt_ratio_max": float(ratio.max()),
                 "response_prompt_ratio_std": float(ratio.std(ddof=0)),
+                "num_turns_mean": turns_mean,
                 "num_turns_p50": float(group["num_turns"].median()),
                 "num_turns_p90": float(group["num_turns"].quantile(0.90)),
+                "response_tokens_per_turn": response_mean / max(turns_mean, 1.0),
                 "found_eval_status_rate": bool_rate(group, "found_eval_status"),
                 "eval_completed_rate": bool_rate(group, "eval_completed"),
                 "resolved_rate": bool_rate(group, "resolved"),
@@ -146,16 +149,28 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def rank_samples(summary: pd.DataFrame, min_ratio: float) -> pd.DataFrame:
+def rank_samples(
+    summary: pd.DataFrame,
+    min_ratio: float,
+    max_turns_p50: float,
+) -> pd.DataFrame:
     result = summary.copy()
-    result["eligible"] = result["response_prompt_ratio_of_means"] >= min_ratio
+    result["eligible"] = (
+        (result["response_prompt_ratio_of_means"] >= min_ratio)
+        & (result["num_turns_p50"] <= max_turns_p50)
+    )
     eligible = result[result["eligible"]].sort_values(
-        ["prompt_tokens_mean", "response_prompt_ratio_of_means", "response_tokens_mean"],
-        ascending=[True, False, False],
+        [
+            "prompt_tokens_mean",
+            "response_tokens_per_turn",
+            "response_prompt_ratio_of_means",
+            "response_tokens_mean",
+        ],
+        ascending=[True, False, False, False],
     )
     ineligible = result[~result["eligible"]].sort_values(
-        ["response_prompt_ratio_of_means", "prompt_tokens_mean"],
-        ascending=[False, True],
+        ["response_prompt_ratio_of_means", "num_turns_p50", "prompt_tokens_mean"],
+        ascending=[False, True, True],
     )
     ranked = pd.concat([eligible, ineligible], ignore_index=True)
     ranked["rank"] = pd.Series(pd.NA, index=ranked.index, dtype="Int64")
@@ -173,6 +188,7 @@ def main() -> None:
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
     parser.add_argument("--min-response-prompt-ratio", type=float, default=5.0)
+    parser.add_argument("--max-turns-p50", type=float, default=20.0)
     args = parser.parse_args()
 
     dataset = pd.read_parquet(args.input)
@@ -199,13 +215,18 @@ def main() -> None:
             "No ROLLOUT_SAMPLE records match instance_id values in the input parquet"
         )
 
-    summary = rank_samples(summarize(records), args.min_response_prompt_ratio)
+    summary = rank_samples(
+        summarize(records),
+        args.min_response_prompt_ratio,
+        args.max_turns_p50,
+    )
     selected_summary = summary[summary["eligible"]].head(args.num_samples).copy()
     if len(selected_summary) < args.num_samples:
         raise ValueError(
             f"Only {len(selected_summary)} instances have response/prompt ratio >= "
-            f"{args.min_response_prompt_ratio:g}, fewer than --num-samples={args.num_samples}. "
-            "Lower --min-response-prompt-ratio."
+            f"{args.min_response_prompt_ratio:g} and turns_p50 <= {args.max_turns_p50:g}, "
+            f"fewer than --num-samples={args.num_samples}. Lower "
+            "--min-response-prompt-ratio or raise --max-turns-p50."
         )
     summary["selected"] = summary["rank"].isin(selected_summary["rank"])
 
@@ -229,7 +250,8 @@ def main() -> None:
     print(f"Logged sessions: {records['session_id'].nunique() if 'session_id' in records else len(records)}")
     print(f"Candidate instances: {len(summary)}")
     print(
-        f"Instances with response/prompt ratio >= {args.min_response_prompt_ratio:g}: "
+        f"Instances with response/prompt ratio >= {args.min_response_prompt_ratio:g} "
+        f"and turns_p50 <= {args.max_turns_p50:g}: "
         f"{int(summary['eligible'].sum())}"
     )
     print(f"Input instances without logs: {len(missing_logged_ids)}")
@@ -249,8 +271,9 @@ def main() -> None:
         print(
             f"rank={row.rank} instance_id={row.instance_id} "
             f"sessions={row.sessions} trajectories={row.trajectory_records} "
-            f"turns_p50={row.num_turns_p50:.1f} "
+            f"turns_mean={row.num_turns_mean:.1f} turns_p50={row.num_turns_p50:.1f} "
             f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
+            f"response_per_turn={row.response_tokens_per_turn:.0f} "
             f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
         )
@@ -266,4 +289,5 @@ if __name__ == "__main__":
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
 #   --num-samples 32 \
-#   --min-response-prompt-ratio 5
+#   --min-response-prompt-ratio 5 \
+#   --max-turns-p50 20
