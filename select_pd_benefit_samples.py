@@ -64,7 +64,13 @@ def parse_logs(paths: list[str]) -> pd.DataFrame:
     if not records:
         raise ValueError(f"No {MARKER} records found")
     frame = pd.DataFrame(records)
-    required = {"instance_id", "num_turns", "prompt_tokens", "response_tokens"}
+    required = {
+        "instance_id",
+        "num_turns",
+        "prompt_tokens",
+        "response_tokens",
+        "model_tokens",
+    }
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"ROLLOUT_SAMPLE records are missing fields: {sorted(missing)}")
@@ -72,7 +78,7 @@ def parse_logs(paths: list[str]) -> pd.DataFrame:
     if dedup:
         frame = frame.drop_duplicates(dedup, keep="last")
     frame = frame[frame["instance_id"].fillna("").astype(str) != ""].copy()
-    for name in ("num_turns", "prompt_tokens", "response_tokens"):
+    for name in ("num_turns", "prompt_tokens", "response_tokens", "model_tokens"):
         frame[name] = pd.to_numeric(frame[name], errors="coerce").fillna(0)
     frame["num_turns"] = frame["num_turns"].clip(lower=1)
     frame["response_prompt_ratio"] = frame["response_tokens"] / frame["prompt_tokens"].clip(lower=1)
@@ -110,35 +116,72 @@ def normal_reason_rate(group: pd.DataFrame) -> float:
 def summarize(records: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for instance_id, group in records.groupby("instance_id", sort=False):
-        ratio = group["response_prompt_ratio"]
-        prompt_mean = float(group["prompt_tokens"].mean())
-        response_mean = float(group["response_tokens"].mean())
-        turns_mean = float(group["num_turns"].mean())
-        sessions = int(group["session_id"].nunique()) if "session_id" in group else len(group)
+        session_key = "session_id" if "session_id" in group else None
+        session_groups = group.groupby(session_key, sort=False) if session_key else [(None, group)]
+        session_rows = []
+        for _, session_group in session_groups:
+            prompt_tokens = float(session_group["prompt_tokens"].sum())
+            response_tokens = float(session_group["response_tokens"].sum())
+            model_tokens = float(session_group["model_tokens"].sum())
+            non_model_tokens = max(response_tokens - model_tokens, 0.0)
+            num_turns = float(session_group["num_turns"].sum())
+
+            # In multi-turn PD, model tokens from all but the final turn become
+            # input to a later P request. With no D-to-P KV return path, use an
+            # even-per-turn approximation for this repeated P-side work.
+            trajectory_turns = session_group["num_turns"].clip(lower=1)
+            repeated_model_tokens = float(
+                (
+                    session_group["model_tokens"]
+                    * (trajectory_turns - 1.0)
+                    / trajectory_turns
+                ).sum()
+            )
+            p_work_proxy = prompt_tokens + non_model_tokens + repeated_model_tokens
+            session_rows.append(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "response_tokens": response_tokens,
+                    "model_tokens": model_tokens,
+                    "non_model_tokens": non_model_tokens,
+                    "num_turns": num_turns,
+                    "p_work_proxy": p_work_proxy,
+                    "decode_pressure_proxy": model_tokens / max(p_work_proxy, 1.0),
+                    "model_tokens_per_turn": model_tokens / max(num_turns, 1.0),
+                }
+            )
+
+        sessions_frame = pd.DataFrame(session_rows)
+        prompt_mean = float(sessions_frame["prompt_tokens"].mean())
+        response_mean = float(sessions_frame["response_tokens"].mean())
+        model_mean = float(sessions_frame["model_tokens"].mean())
+        non_model_mean = float(sessions_frame["non_model_tokens"].mean())
+        turns_mean = float(sessions_frame["num_turns"].mean())
+        p_work_mean = float(sessions_frame["p_work_proxy"].mean())
+        sessions = len(sessions_frame)
         rows.append(
             {
                 "instance_id": str(instance_id),
                 "sessions": sessions,
                 "trajectory_records": len(group),
-                "prompt_tokens_p25": float(group["prompt_tokens"].quantile(0.25)),
-                "prompt_tokens_p50": float(group["prompt_tokens"].median()),
+                "prompt_tokens_p25": float(sessions_frame["prompt_tokens"].quantile(0.25)),
+                "prompt_tokens_p50": float(sessions_frame["prompt_tokens"].median()),
                 "prompt_tokens_mean": prompt_mean,
-                "response_tokens_min": float(group["response_tokens"].min()),
-                "response_tokens_p25": float(group["response_tokens"].quantile(0.25)),
-                "response_tokens_p50": float(group["response_tokens"].median()),
+                "response_tokens_min": float(sessions_frame["response_tokens"].min()),
+                "response_tokens_p25": float(sessions_frame["response_tokens"].quantile(0.25)),
+                "response_tokens_p50": float(sessions_frame["response_tokens"].median()),
                 "response_tokens_mean": response_mean,
-                "response_tokens_max": float(group["response_tokens"].max()),
+                "response_tokens_max": float(sessions_frame["response_tokens"].max()),
+                "model_tokens_mean": model_mean,
+                "non_model_tokens_mean": non_model_mean,
                 "response_prompt_ratio_of_means": response_mean / max(prompt_mean, 1.0),
-                "response_prompt_ratio_min": float(ratio.min()),
-                "response_prompt_ratio_p25": float(ratio.quantile(0.25)),
-                "response_prompt_ratio_p50": float(ratio.median()),
-                "response_prompt_ratio_mean": float(ratio.mean()),
-                "response_prompt_ratio_max": float(ratio.max()),
-                "response_prompt_ratio_std": float(ratio.std(ddof=0)),
+                "model_prompt_ratio_of_means": model_mean / max(prompt_mean, 1.0),
                 "num_turns_mean": turns_mean,
-                "num_turns_p50": float(group["num_turns"].median()),
-                "num_turns_p90": float(group["num_turns"].quantile(0.90)),
-                "response_tokens_per_turn": response_mean / max(turns_mean, 1.0),
+                "num_turns_p50": float(sessions_frame["num_turns"].median()),
+                "num_turns_p90": float(sessions_frame["num_turns"].quantile(0.90)),
+                "model_tokens_per_turn": float(sessions_frame["model_tokens_per_turn"].mean()),
+                "p_work_proxy_mean": p_work_mean,
+                "decode_pressure_proxy": model_mean / max(p_work_mean, 1.0),
                 "found_eval_status_rate": bool_rate(group, "found_eval_status"),
                 "eval_completed_rate": bool_rate(group, "eval_completed"),
                 "resolved_rate": bool_rate(group, "resolved"),
@@ -149,46 +192,29 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def rank_samples(
-    summary: pd.DataFrame,
-    min_ratio: float,
-    max_turns_p50: float,
-) -> pd.DataFrame:
-    result = summary.copy()
-    result["eligible"] = (
-        (result["response_prompt_ratio_of_means"] >= min_ratio)
-        & (result["num_turns_p50"] <= max_turns_p50)
-    )
-    eligible = result[result["eligible"]].sort_values(
+def rank_samples(summary: pd.DataFrame) -> pd.DataFrame:
+    ranked = summary.sort_values(
         [
+            "decode_pressure_proxy",
+            "model_tokens_per_turn",
+            "model_tokens_mean",
             "prompt_tokens_mean",
-            "response_tokens_per_turn",
-            "response_prompt_ratio_of_means",
-            "response_tokens_mean",
         ],
-        ascending=[True, False, False, False],
-    )
-    ineligible = result[~result["eligible"]].sort_values(
-        ["response_prompt_ratio_of_means", "num_turns_p50", "prompt_tokens_mean"],
-        ascending=[False, True, True],
-    )
-    ranked = pd.concat([eligible, ineligible], ignore_index=True)
-    ranked["rank"] = pd.Series(pd.NA, index=ranked.index, dtype="Int64")
-    ranked.loc[ranked["eligible"], "rank"] = range(1, len(eligible) + 1)
+        ascending=[False, False, False, True],
+    ).reset_index(drop=True)
+    ranked["rank"] = range(1, len(ranked) + 1)
     return ranked
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Select agent tasks with a large and stable response-to-prompt ratio"
+        description="Select agent tasks with high decode pressure for 1P+multi-D rollout"
     )
     parser.add_argument("--log", nargs="+", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
-    parser.add_argument("--min-response-prompt-ratio", type=float, default=5.0)
-    parser.add_argument("--max-turns-p50", type=float, default=20.0)
     args = parser.parse_args()
 
     dataset = pd.read_parquet(args.input)
@@ -215,18 +241,12 @@ def main() -> None:
             "No ROLLOUT_SAMPLE records match instance_id values in the input parquet"
         )
 
-    summary = rank_samples(
-        summarize(records),
-        args.min_response_prompt_ratio,
-        args.max_turns_p50,
-    )
-    selected_summary = summary[summary["eligible"]].head(args.num_samples).copy()
+    summary = rank_samples(summarize(records))
+    selected_summary = summary.head(args.num_samples).copy()
     if len(selected_summary) < args.num_samples:
         raise ValueError(
-            f"Only {len(selected_summary)} instances have response/prompt ratio >= "
-            f"{args.min_response_prompt_ratio:g} and turns_p50 <= {args.max_turns_p50:g}, "
-            f"fewer than --num-samples={args.num_samples}. Lower "
-            "--min-response-prompt-ratio or raise --max-turns-p50."
+            f"Only {len(selected_summary)} logged instances from the input parquet, "
+            f"fewer than --num-samples={args.num_samples}"
         )
     summary["selected"] = summary["rank"].isin(selected_summary["rank"])
 
@@ -243,22 +263,19 @@ def main() -> None:
     missing_logged_ids = sorted(input_ids - set(records["instance_id"]))
     prompt_mean = float(records["prompt_tokens"].mean())
     response_mean = float(records["response_tokens"].mean())
+    model_mean = float(records["model_tokens"].mean())
     print(f"ROLLOUT_SAMPLE records: {len(all_records)}")
     print(f"Matched records: {len(records)}")
     print(f"Ignored records outside input parquet: {ignored_records}")
     print(f"Ignored instances outside input parquet: {ignored_instances}")
     print(f"Logged sessions: {records['session_id'].nunique() if 'session_id' in records else len(records)}")
     print(f"Candidate instances: {len(summary)}")
-    print(
-        f"Instances with response/prompt ratio >= {args.min_response_prompt_ratio:g} "
-        f"and turns_p50 <= {args.max_turns_p50:g}: "
-        f"{int(summary['eligible'].sum())}"
-    )
     print(f"Input instances without logs: {len(missing_logged_ids)}")
     if missing_logged_ids:
         print(f"Missing instance_id values: {missing_logged_ids}")
     print(f"All-record prompt mean: {prompt_mean:.3f}")
     print(f"All-record response mean: {response_mean:.3f}")
+    print(f"All-record model-token mean: {model_mean:.3f}")
     print(f"All-record response/prompt ratio: {response_mean / max(prompt_mean, 1.0):.6f}")
     print(
         "Highest instance response/prompt ratio: "
@@ -273,7 +290,10 @@ def main() -> None:
             f"sessions={row.sessions} trajectories={row.trajectory_records} "
             f"turns_mean={row.num_turns_mean:.1f} turns_p50={row.num_turns_p50:.1f} "
             f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
-            f"response_per_turn={row.response_tokens_per_turn:.0f} "
+            f"model_mean={row.model_tokens_mean:.0f} non_model_mean={row.non_model_tokens_mean:.0f} "
+            f"model_per_turn={row.model_tokens_per_turn:.0f} "
+            f"p_work_proxy={row.p_work_proxy_mean:.0f} "
+            f"decode_pressure={row.decode_pressure_proxy:.3f} "
             f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
         )
@@ -288,6 +308,4 @@ if __name__ == "__main__":
 #   --input swe_rebench_hard200.parquet \
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
-#   --num-samples 32 \
-#   --min-response-prompt-ratio 5 \
-#   --max-turns-p50 20
+#   --num-samples 32
