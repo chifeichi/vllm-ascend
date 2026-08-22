@@ -249,6 +249,12 @@ def rank_samples(
     result["stable_model_tokens_percentile"] = result["model_tokens_p25"].rank(
         method="average", pct=True, ascending=True
     )
+    result["stable_decode_pressure_percentile"] = result[
+        "decode_pressure_proxy_p25"
+    ].rank(method="average", pct=True, ascending=True)
+    result["p_cache_headroom_percentile"] = 1.0 - result["p_work_proxy_p75"].rank(
+        method="average", pct=True, ascending=True
+    )
     result["low_turns_percentile"] = 1.0 - result["num_turns_p75"].rank(
         method="average", pct=True, ascending=True
     )
@@ -256,16 +262,18 @@ def rank_samples(
         method="average", pct=True, ascending=True
     )
 
-    # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  This
-    # score therefore favors the strongest available proxy for sustained D
-    # supply: long model generations per turn that repeat consistently across
-    # rollout.n observations, with little non-model response content.
+    # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  The
+    # score therefore balances a stable, long model generation per turn against
+    # the P-side work/cache footprint needed to produce it.  In particular,
+    # high model_tokens_per_turn alone must not let a long-prompt sample rank at
+    # the top when model output is small relative to P work.
     result["pd_suitability_score"] = (
-        0.45 * result["stable_model_per_turn_percentile"]
-        + 0.20 * result["stable_model_share_percentile"]
-        + 0.15 * result["stable_model_tokens_percentile"]
-        + 0.10 * result["low_turns_percentile"]
-        + 0.10 * result["stable_rollouts_percentile"]
+        0.35 * result["stable_model_per_turn_percentile"]
+        + 0.25 * result["stable_decode_pressure_percentile"]
+        + 0.20 * result["p_cache_headroom_percentile"]
+        + 0.10 * result["stable_model_share_percentile"]
+        + 0.05 * result["low_turns_percentile"]
+        + 0.05 * result["stable_rollouts_percentile"]
     )
     result["pd_score_rank_all"] = result["pd_suitability_score"].rank(
         method="min", ascending=False
@@ -598,6 +606,8 @@ def main() -> None:
             f"context_p75={row.final_context_tokens_p75:.0f} "
             f"total_work={row.total_work_proxy_mean:.0f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
+            f"decode_pressure_p25={row.decode_pressure_proxy_p25:.3f} "
+            f"p_cache_headroom_percentile={row.p_cache_headroom_percentile:.3f} "
             f"pd_suitability_score={row.pd_suitability_score:.3f} "
             f"response_prompt_ratio_mean={row.response_prompt_ratio_of_means:.3f} "
             f"response_prompt_ratio_p25={row.response_prompt_ratio_p25:.3f} "
