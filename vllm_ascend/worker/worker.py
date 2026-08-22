@@ -727,6 +727,18 @@ class NPUWorker(WorkerBase):
         if not self.model_config.enforce_eager:
             npugraph_memory_bytes = self.model_runner.capture_model()
 
+        if get_tp_group().rank_in_group == 0:
+            print(
+                "[VLLM_ASCEND_GRAPH_MEMORY] "
+                f"pid={os.getpid()} "
+                f"replica_rank={os.getenv('VERL_REPLICA_RANK', '-1')} "
+                f"pd_role={os.getenv('VERL_PD_ROLE', 'unified')} "
+                f"pd_index={os.getenv('VERL_PD_INDEX', '-1')} "
+                f"npugraph_memory_bytes={npugraph_memory_bytes} "
+                f"npugraph_memory_gib={npugraph_memory_bytes / GiB_bytes:.3f}",
+                flush=True,
+            )
+
         # Suggest an optimal --kv-cache-memory value for future runs.
         # Only emitted when we ran full profiling (kv_cache_memory_bytes was not
         # pre-specified) so that peak_activation_memory etc. are available.
