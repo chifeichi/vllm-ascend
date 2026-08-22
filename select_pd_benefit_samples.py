@@ -145,9 +145,13 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                     "model_tokens": model_tokens,
                     "non_model_tokens": non_model_tokens,
                     "num_turns": num_turns,
+                    "final_context_tokens": prompt_tokens + response_tokens,
                     "p_work_proxy": p_work_proxy,
                     "decode_pressure_proxy": model_tokens / max(p_work_proxy, 1.0),
                     "model_tokens_per_turn": model_tokens / max(num_turns, 1.0),
+                    "response_prompt_ratio": response_tokens / max(prompt_tokens, 1.0),
+                    "model_prompt_ratio": model_tokens / max(prompt_tokens, 1.0),
+                    "model_response_share": model_tokens / max(response_tokens, 1.0),
                 }
             )
 
@@ -158,6 +162,10 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
         non_model_mean = float(sessions_frame["non_model_tokens"].mean())
         turns_mean = float(sessions_frame["num_turns"].mean())
         p_work_mean = float(sessions_frame["p_work_proxy"].mean())
+        total_work = sessions_frame["p_work_proxy"] + sessions_frame["model_tokens"]
+        model_per_turn = sessions_frame["model_tokens_per_turn"]
+        model_per_turn_mean = float(model_per_turn.mean())
+        model_per_turn_std = float(model_per_turn.std(ddof=0))
         sessions = len(sessions_frame)
         rows.append(
             {
@@ -172,16 +180,46 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "response_tokens_p50": float(sessions_frame["response_tokens"].median()),
                 "response_tokens_mean": response_mean,
                 "response_tokens_max": float(sessions_frame["response_tokens"].max()),
+                "final_context_tokens_p75": float(
+                    sessions_frame["final_context_tokens"].quantile(0.75)
+                ),
+                "final_context_tokens_max": float(sessions_frame["final_context_tokens"].max()),
+                "model_tokens_p25": float(sessions_frame["model_tokens"].quantile(0.25)),
                 "model_tokens_mean": model_mean,
                 "non_model_tokens_mean": non_model_mean,
                 "response_prompt_ratio_of_means": response_mean / max(prompt_mean, 1.0),
+                "response_prompt_ratio_p25": float(
+                    sessions_frame["response_prompt_ratio"].quantile(0.25)
+                ),
                 "model_prompt_ratio_of_means": model_mean / max(prompt_mean, 1.0),
+                "model_prompt_ratio_p25": float(
+                    sessions_frame["model_prompt_ratio"].quantile(0.25)
+                ),
+                "model_response_share_mean": float(sessions_frame["model_response_share"].mean()),
+                "model_response_share_p25": float(
+                    sessions_frame["model_response_share"].quantile(0.25)
+                ),
                 "num_turns_mean": turns_mean,
                 "num_turns_p50": float(sessions_frame["num_turns"].median()),
+                "num_turns_p75": float(sessions_frame["num_turns"].quantile(0.75)),
                 "num_turns_p90": float(sessions_frame["num_turns"].quantile(0.90)),
-                "model_tokens_per_turn": float(sessions_frame["model_tokens_per_turn"].mean()),
+                "model_tokens_per_turn": model_per_turn_mean,
+                "model_tokens_per_turn_p25": float(model_per_turn.quantile(0.25)),
+                "model_tokens_per_turn_std": model_per_turn_std,
+                "model_tokens_per_turn_cv": (
+                    model_per_turn_std / model_per_turn_mean
+                    if model_per_turn_mean > 0
+                    else float("inf")
+                ),
                 "p_work_proxy_mean": p_work_mean,
+                "p_work_proxy_p75": float(sessions_frame["p_work_proxy"].quantile(0.75)),
+                "p_work_proxy_max": float(sessions_frame["p_work_proxy"].max()),
+                "total_work_proxy_mean": float(total_work.mean()),
+                "total_work_proxy_max": float(total_work.max()),
                 "decode_pressure_proxy": model_mean / max(p_work_mean, 1.0),
+                "decode_pressure_proxy_p25": float(
+                    sessions_frame["decode_pressure_proxy"].quantile(0.25)
+                ),
                 "found_eval_status_rate": bool_rate(group, "found_eval_status"),
                 "eval_completed_rate": bool_rate(group, "eval_completed"),
                 "resolved_rate": bool_rate(group, "resolved"),
@@ -192,48 +230,161 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def rank_samples(summary: pd.DataFrame) -> pd.DataFrame:
+def rank_samples(
+    summary: pd.DataFrame,
+    tail_quantile: float,
+    cache_quantile: float,
+    max_turns_quantile: float,
+    rollout_n: int,
+    min_model_prompt_ratio: float | None,
+    max_turns_mean: float | None,
+) -> pd.DataFrame:
     result = summary.copy()
-    result["decode_pressure_percentile"] = result["decode_pressure_proxy"].rank(
+    result["stable_model_per_turn_percentile"] = result["model_tokens_per_turn_p25"].rank(
         method="average", pct=True, ascending=True
     )
-    result["model_per_turn_percentile"] = result["model_tokens_per_turn"].rank(
+    result["stable_model_share_percentile"] = result["model_response_share_p25"].rank(
         method="average", pct=True, ascending=True
     )
-    result["low_turn_percentile"] = result["num_turns_mean"].rank(
-        method="average", pct=True, ascending=False
+    result["stable_model_tokens_percentile"] = result["model_tokens_p25"].rank(
+        method="average", pct=True, ascending=True
     )
-    result["pd_selection_score"] = result[
-        [
-            "decode_pressure_percentile",
-            "model_per_turn_percentile",
-            "low_turn_percentile",
-        ]
-    ].mean(axis=1)
+    result["low_turns_percentile"] = 1.0 - result["num_turns_p75"].rank(
+        method="average", pct=True, ascending=True
+    )
+    result["stable_rollouts_percentile"] = 1.0 - result["model_tokens_per_turn_cv"].rank(
+        method="average", pct=True, ascending=True
+    )
 
-    ranked = result.sort_values(
-        [
-            "pd_selection_score",
-            "decode_pressure_proxy",
-            "model_tokens_per_turn",
-            "num_turns_mean",
-        ],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-    ranked["rank"] = range(1, len(ranked) + 1)
+    # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  This
+    # score therefore favors the strongest available proxy for sustained D
+    # supply: long model generations per turn that repeat consistently across
+    # rollout.n observations, with little non-model response content.
+    result["pd_suitability_score"] = (
+        0.45 * result["stable_model_per_turn_percentile"]
+        + 0.20 * result["stable_model_share_percentile"]
+        + 0.15 * result["stable_model_tokens_percentile"]
+        + 0.10 * result["low_turns_percentile"]
+        + 0.10 * result["stable_rollouts_percentile"]
+    )
+
+    tail_cutoff = float(result["total_work_proxy_max"].quantile(tail_quantile))
+    result["tail_work_cutoff"] = tail_cutoff
+    result["tail_eligible"] = result["total_work_proxy_max"] <= tail_cutoff
+
+    p_work_cutoff = float(result["p_work_proxy_p75"].quantile(cache_quantile))
+    context_cutoff = float(result["final_context_tokens_p75"].quantile(cache_quantile))
+    result["p_work_cache_cutoff"] = p_work_cutoff
+    result["context_cache_cutoff"] = context_cutoff
+    result["cache_eligible"] = (
+        (result["p_work_proxy_p75"] <= p_work_cutoff)
+        & (result["final_context_tokens_p75"] <= context_cutoff)
+    )
+
+    result["rollout_n_eligible"] = (
+        (result["sessions"] >= rollout_n)
+        & (result["sessions"] % rollout_n == 0)
+        & (result["trajectory_records"] == result["sessions"])
+    )
+    result["ratio_eligible"] = (
+        True
+        if min_model_prompt_ratio is None
+        else result["model_prompt_ratio_p25"] >= min_model_prompt_ratio
+    )
+    turns_cutoff = (
+        float(result["num_turns_mean"].quantile(max_turns_quantile))
+        if max_turns_mean is None
+        else max_turns_mean
+    )
+    result["turns_cutoff"] = turns_cutoff
+    result["turns_eligible"] = result["num_turns_mean"] <= turns_cutoff
+    result["trajectory_eligible"] = (
+        (result["exit_success_rate"] >= 1.0)
+        & (result["normal_reason_rate"] >= 1.0)
+    )
+    result["selection_eligible"] = (
+        result["tail_eligible"]
+        & result["cache_eligible"]
+        & result["rollout_n_eligible"]
+        & result["ratio_eligible"]
+        & result["turns_eligible"]
+        & result["trajectory_eligible"]
+    )
+
+    sort_columns = [
+        "pd_suitability_score",
+        "model_tokens_per_turn_p25",
+        "model_response_share_p25",
+        "model_tokens_p25",
+        "num_turns_mean",
+    ]
+    ascending = [False, False, False, False, True]
+    eligible = result[result["selection_eligible"]].sort_values(
+        sort_columns,
+        ascending=ascending,
+    )
+    excluded = result[~result["selection_eligible"]].sort_values(
+        sort_columns,
+        ascending=ascending,
+    )
+    ranked = pd.concat([eligible, excluded], ignore_index=True)
+    ranked["rank"] = pd.Series(pd.NA, index=ranked.index, dtype="Int64")
+    ranked.loc[ranked["selection_eligible"], "rank"] = range(1, len(eligible) + 1)
     return ranked
+
+
+def _validate_tail_quantile(value: float) -> float:
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError("tail quantile must be in (0, 1]")
+    return value
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Select agent tasks with high decode pressure for 1P+multi-D rollout"
+        description=(
+            "Select stable, cache-safe agent tasks with sustained model generation "
+            "for 1P+multi-D rollout"
+        )
     )
     parser.add_argument("--log", nargs="+", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
+    parser.add_argument(
+        "--rollout-n",
+        type=int,
+        default=4,
+        help=(
+            "Expected repeated rollouts per instance. Instances must have one or "
+            "more complete groups and one trajectory per session (default: 4)."
+        ),
+    )
+    parser.add_argument("--tail-quantile", type=_validate_tail_quantile, default=0.90)
+    parser.add_argument(
+        "--cache-quantile",
+        type=_validate_tail_quantile,
+        default=0.80,
+        help=(
+            "Keep instances whose P75 P-work and final-context proxies are no "
+            "larger than this population quantile (default: 0.80)."
+        ),
+    )
+    parser.add_argument(
+        "--max-turns-quantile",
+        type=_validate_tail_quantile,
+        default=0.75,
+        help=(
+            "Automatic mean-turn cutoff when --max-turns-mean is omitted "
+            "(default: population P75)."
+        ),
+    )
+    parser.add_argument("--min-model-prompt-ratio", type=float)
+    parser.add_argument("--max-turns-mean", type=float)
     args = parser.parse_args()
+
+    if args.rollout_n <= 0:
+        parser.error("--rollout-n must be greater than zero")
 
     dataset = pd.read_parquet(args.input)
     ids = dataset.apply(dataset_instance_id, axis=1)
@@ -259,14 +410,25 @@ def main() -> None:
             "No ROLLOUT_SAMPLE records match instance_id values in the input parquet"
         )
 
-    summary = rank_samples(summarize(records))
-    selected_summary = summary.head(args.num_samples).copy()
+    summary = rank_samples(
+        summarize(records),
+        args.tail_quantile,
+        args.cache_quantile,
+        args.max_turns_quantile,
+        args.rollout_n,
+        args.min_model_prompt_ratio,
+        args.max_turns_mean,
+    )
+    selected_summary = summary[summary["selection_eligible"]].head(args.num_samples).copy()
+    summary["selected"] = summary["rank"].isin(selected_summary["rank"])
+    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(args.report, index=False)
     if len(selected_summary) < args.num_samples:
         raise ValueError(
-            f"Only {len(selected_summary)} logged instances from the input parquet, "
-            f"fewer than --num-samples={args.num_samples}"
+            f"Only {len(selected_summary)} instances satisfy the enabled validity/tail constraints, "
+            f"fewer than --num-samples={args.num_samples}. Do not fill the remainder with weak "
+            f"relative candidates; inspect {args.report} eligibility columns or expand the input pool."
         )
-    summary["selected"] = summary["rank"].isin(selected_summary["rank"])
 
     rank = dict(zip(selected_summary["instance_id"], selected_summary["rank"], strict=True))
     selected = dataset[ids.isin(rank)].copy()
@@ -274,9 +436,7 @@ def main() -> None:
     selected = selected.sort_values("_selection_rank").drop(columns="_selection_rank")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     selected.to_parquet(args.output, index=False)
-    summary.to_csv(args.report, index=False)
 
     missing_logged_ids = sorted(input_ids - set(records["instance_id"]))
     prompt_mean = float(records["prompt_tokens"].mean())
@@ -288,6 +448,38 @@ def main() -> None:
     print(f"Ignored instances outside input parquet: {ignored_instances}")
     print(f"Logged sessions: {records['session_id'].nunique() if 'session_id' in records else len(records)}")
     print(f"Candidate instances: {len(summary)}")
+    print(
+        f"Tail-eligible instances: {int(summary['tail_eligible'].sum())} "
+        f"(P{args.tail_quantile * 100:g} total-work cutoff="
+        f"{summary['tail_work_cutoff'].iloc[0]:.0f})"
+    )
+    print(
+        f"rollout.n-eligible instances: {int(summary['rollout_n_eligible'].sum())} "
+        f"(complete groups of n={args.rollout_n}, one trajectory per session)"
+    )
+    print(
+        f"Cache-eligible instances: {int(summary['cache_eligible'].sum())} "
+        f"(P{args.cache_quantile * 100:g} cutoffs: "
+        f"P-work P75<={summary['p_work_cache_cutoff'].iloc[0]:.0f}, "
+        f"final-context P75<={summary['context_cache_cutoff'].iloc[0]:.0f})"
+    )
+    if args.min_model_prompt_ratio is None:
+        print("Model/prompt hard threshold: disabled")
+    else:
+        print(
+            f"Ratio-eligible instances: {int(summary['ratio_eligible'].sum())} "
+            f"(model/prompt P25 >= {args.min_model_prompt_ratio:.6f})"
+        )
+    turns_source = (
+        f"population P{args.max_turns_quantile * 100:g}"
+        if args.max_turns_mean is None
+        else "--max-turns-mean"
+    )
+    print(
+        f"Turn-eligible instances: {int(summary['turns_eligible'].sum())} "
+        f"(turns mean <= {summary['turns_cutoff'].iloc[0]:g}, {turns_source})"
+    )
+    print(f"Fully eligible instances: {int(summary['selection_eligible'].sum())}")
     print(f"Input instances without logs: {len(missing_logged_ids)}")
     if missing_logged_ids:
         print(f"Missing instance_id values: {missing_logged_ids}")
@@ -309,11 +501,20 @@ def main() -> None:
             f"turns_mean={row.num_turns_mean:.1f} turns_p50={row.num_turns_p50:.1f} "
             f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
             f"model_mean={row.model_tokens_mean:.0f} non_model_mean={row.non_model_tokens_mean:.0f} "
-            f"model_per_turn={row.model_tokens_per_turn:.0f} "
+            f"model_per_turn_mean={row.model_tokens_per_turn:.0f} "
+            f"model_per_turn_p25={row.model_tokens_per_turn_p25:.0f} "
+            f"model_per_turn_cv={row.model_tokens_per_turn_cv:.3f} "
             f"p_work_proxy={row.p_work_proxy_mean:.0f} "
+            f"p_work_p75={row.p_work_proxy_p75:.0f} "
+            f"context_p75={row.final_context_tokens_p75:.0f} "
+            f"total_work={row.total_work_proxy_mean:.0f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
-            f"pd_score={row.pd_selection_score:.3f} "
-            f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
+            f"pd_score={row.pd_suitability_score:.3f} "
+            f"response_prompt_ratio_mean={row.response_prompt_ratio_of_means:.3f} "
+            f"response_prompt_ratio_p25={row.response_prompt_ratio_p25:.3f} "
+            f"model_prompt_ratio_mean={row.model_prompt_ratio_of_means:.3f} "
+            f"model_prompt_ratio_p25={row.model_prompt_ratio_p25:.3f} "
+            f"model_response_share_p25={row.model_response_share_p25:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
         )
 
@@ -327,4 +528,6 @@ if __name__ == "__main__":
 #   --input swe_rebench_hard200.parquet \
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
-#   --num-samples 32
+#   --num-samples 32 \
+#   --rollout-n 4 \
+#   --tail-quantile 0.90
