@@ -193,12 +193,30 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
 
 
 def rank_samples(summary: pd.DataFrame) -> pd.DataFrame:
-    ranked = summary.sort_values(
+    result = summary.copy()
+    result["decode_pressure_percentile"] = result["decode_pressure_proxy"].rank(
+        method="average", pct=True, ascending=True
+    )
+    result["model_per_turn_percentile"] = result["model_tokens_per_turn"].rank(
+        method="average", pct=True, ascending=True
+    )
+    result["low_turn_percentile"] = result["num_turns_mean"].rank(
+        method="average", pct=True, ascending=False
+    )
+    result["pd_selection_score"] = result[
         [
+            "decode_pressure_percentile",
+            "model_per_turn_percentile",
+            "low_turn_percentile",
+        ]
+    ].mean(axis=1)
+
+    ranked = result.sort_values(
+        [
+            "pd_selection_score",
             "decode_pressure_proxy",
             "model_tokens_per_turn",
-            "model_tokens_mean",
-            "prompt_tokens_mean",
+            "num_turns_mean",
         ],
         ascending=[False, False, False, True],
     ).reset_index(drop=True)
@@ -294,6 +312,7 @@ def main() -> None:
             f"model_per_turn={row.model_tokens_per_turn:.0f} "
             f"p_work_proxy={row.p_work_proxy_mean:.0f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
+            f"pd_score={row.pd_selection_score:.3f} "
             f"response_prompt_ratio={row.response_prompt_ratio_of_means:.3f} "
             f"exit_success_rate={row.exit_success_rate:.2f} resolved_rate={row.resolved_rate:.2f}"
         )
