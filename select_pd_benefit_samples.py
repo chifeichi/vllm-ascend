@@ -267,6 +267,9 @@ def rank_samples(
         + 0.10 * result["low_turns_percentile"]
         + 0.10 * result["stable_rollouts_percentile"]
     )
+    result["pd_score_rank_all"] = result["pd_suitability_score"].rank(
+        method="min", ascending=False
+    ).astype(int)
 
     tail_cutoff = float(result["total_work_proxy_max"].quantile(tail_quantile))
     result["tail_work_cutoff"] = tail_cutoff
@@ -348,6 +351,13 @@ def main() -> None:
     )
     parser.add_argument("--log", nargs="+", required=True)
     parser.add_argument("--input", required=True)
+    parser.add_argument(
+        "--score-input",
+        help=(
+            "Optional previously selected parquet to score against the current "
+            "--input candidate population. Does not affect the new selection."
+        ),
+    )
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
@@ -419,6 +429,22 @@ def main() -> None:
         args.min_model_prompt_ratio,
         args.max_turns_mean,
     )
+
+    scored_input_ids: set[str] = set()
+    missing_scored_ids: list[str] = []
+    if args.score_input:
+        scored_dataset = pd.read_parquet(args.score_input)
+        scored_ids = scored_dataset.apply(dataset_instance_id, axis=1)
+        empty_scored_id_count = int((scored_ids == "").sum())
+        if empty_scored_id_count:
+            raise ValueError(
+                f"Cannot resolve instance_id for {empty_scored_id_count} rows in "
+                f"--score-input={args.score_input}"
+            )
+        scored_input_ids = set(scored_ids)
+        missing_scored_ids = sorted(scored_input_ids - set(summary["instance_id"]))
+    summary["in_score_input"] = summary["instance_id"].isin(scored_input_ids)
+
     selected_summary = summary[summary["selection_eligible"]].head(args.num_samples).copy()
     summary["selected"] = summary["rank"].isin(selected_summary["rank"])
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +538,49 @@ def main() -> None:
         "Selected aggregate response:prompt ratio: "
         f"{selected_response_prompt_ratio:.6f}:1"
     )
+    if args.score_input:
+        scored_summary = summary[summary["in_score_input"]].sort_values(
+            ["pd_score_rank_all", "instance_id"], kind="stable"
+        )
+        overlap = int(scored_summary["selected"].sum())
+        print(f"Score-input parquet: {args.score_input}")
+        print(f"Score-input instance IDs: {len(scored_input_ids)}")
+        print(f"Score-input IDs matched to current report: {len(scored_summary)}")
+        print(f"Score-input IDs missing from current logs/input: {len(missing_scored_ids)}")
+        if missing_scored_ids:
+            print(f"Missing score-input instance_id values: {missing_scored_ids}")
+        print(f"Score-input overlap with new selection: {overlap}/{len(scored_summary)}")
+        if not scored_summary.empty:
+            print(
+                "Score-input pd_suitability_score "
+                f"mean={scored_summary['pd_suitability_score'].mean():.6f} "
+                f"min={scored_summary['pd_suitability_score'].min():.6f} "
+                f"max={scored_summary['pd_suitability_score'].max():.6f}"
+            )
+            print("Score-input instances under current criteria:")
+            for row in scored_summary.itertuples(index=False):
+                current_rank = "-" if pd.isna(row.rank) else str(int(row.rank))
+                failed = [
+                    name.removesuffix("_eligible")
+                    for name in (
+                        "rollout_n_eligible",
+                        "trajectory_eligible",
+                        "tail_eligible",
+                        "cache_eligible",
+                        "turns_eligible",
+                        "ratio_eligible",
+                    )
+                    if not getattr(row, name)
+                ]
+                print(
+                    f"instance_id={row.instance_id} "
+                    f"pd_suitability_score={row.pd_suitability_score:.6f} "
+                    f"score_rank_all={row.pd_score_rank_all}/{len(summary)} "
+                    f"eligible_rank={current_rank} "
+                    f"selection_eligible={row.selection_eligible} "
+                    f"selected_now={row.selected} "
+                    f"failed={','.join(failed) if failed else '-'}"
+                )
     print(f"Output parquet: {args.output}")
     print(f"Selection report: {args.report}")
     for row in selected_summary.itertuples(index=False):
@@ -546,6 +615,7 @@ if __name__ == "__main__":
 # python select_pd_benefit_samples.py \
 #   --log 1.log \
 #   --input swe_rebench_hard200.parquet \
+#   --score-input old_swe_rebench_pd64.parquet \
 #   --output swe_rebench_pd64.parquet \
 #   --report swe_rebench_pd_selection.csv \
 #   --num-samples 32 \
