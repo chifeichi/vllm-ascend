@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import math
 import re
+from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
@@ -163,6 +165,9 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
         turns_mean = float(sessions_frame["num_turns"].mean())
         p_work_mean = float(sessions_frame["p_work_proxy"].mean())
         total_work = sessions_frame["p_work_proxy"] + sessions_frame["model_tokens"]
+        total_work_mean = float(total_work.mean())
+        total_work_p50 = float(total_work.median())
+        total_work_std = float(total_work.std(ddof=0))
         model_per_turn = sessions_frame["model_tokens_per_turn"]
         model_per_turn_mean = float(model_per_turn.mean())
         model_per_turn_std = float(model_per_turn.std(ddof=0))
@@ -180,6 +185,10 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "response_tokens_p50": float(sessions_frame["response_tokens"].median()),
                 "response_tokens_mean": response_mean,
                 "response_tokens_max": float(sessions_frame["response_tokens"].max()),
+                "response_tokens_tail_ratio": float(
+                    sessions_frame["response_tokens"].max()
+                    / max(sessions_frame["response_tokens"].median(), 1.0)
+                ),
                 "final_context_tokens_p75": float(
                     sessions_frame["final_context_tokens"].quantile(0.75)
                 ),
@@ -203,6 +212,11 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "num_turns_p50": float(sessions_frame["num_turns"].median()),
                 "num_turns_p75": float(sessions_frame["num_turns"].quantile(0.75)),
                 "num_turns_p90": float(sessions_frame["num_turns"].quantile(0.90)),
+                "num_turns_max": float(sessions_frame["num_turns"].max()),
+                "num_turns_tail_ratio": float(
+                    sessions_frame["num_turns"].max()
+                    / max(sessions_frame["num_turns"].median(), 1.0)
+                ),
                 "model_tokens_per_turn": model_per_turn_mean,
                 "model_tokens_per_turn_p25": float(model_per_turn.quantile(0.25)),
                 "model_tokens_per_turn_std": model_per_turn_std,
@@ -214,8 +228,18 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "p_work_proxy_mean": p_work_mean,
                 "p_work_proxy_p75": float(sessions_frame["p_work_proxy"].quantile(0.75)),
                 "p_work_proxy_max": float(sessions_frame["p_work_proxy"].max()),
-                "total_work_proxy_mean": float(total_work.mean()),
+                "total_work_proxy_mean": total_work_mean,
+                "total_work_proxy_p50": total_work_p50,
+                "total_work_proxy_std": total_work_std,
+                "total_work_proxy_cv": (
+                    total_work_std / total_work_mean
+                    if total_work_mean > 0
+                    else float("inf")
+                ),
                 "total_work_proxy_max": float(total_work.max()),
+                "total_work_proxy_tail_ratio": float(
+                    total_work.max() / max(total_work_p50, 1.0)
+                ),
                 "decode_pressure_proxy": model_mean / max(p_work_mean, 1.0),
                 "decode_pressure_proxy_p25": float(
                     sessions_frame["decode_pressure_proxy"].quantile(0.25)
@@ -336,10 +360,124 @@ def rank_samples(
     return ranked
 
 
-def _validate_tail_quantile(value: float) -> float:
-    if not 0.0 < value <= 1.0:
+def mark_stable_candidates(
+    summary: pd.DataFrame,
+    max_work_cv: float,
+    max_work_tail_ratio: float,
+    max_turns_tail_ratio: float,
+    max_response_tail_ratio: float,
+) -> pd.DataFrame:
+    result = summary.copy()
+    result["work_cv_eligible"] = result["total_work_proxy_cv"] <= max_work_cv
+    result["work_tail_ratio_eligible"] = (
+        result["total_work_proxy_tail_ratio"] <= max_work_tail_ratio
+    )
+    result["turns_tail_ratio_eligible"] = (
+        result["num_turns_tail_ratio"] <= max_turns_tail_ratio
+    )
+    result["response_tail_ratio_eligible"] = (
+        result["response_tokens_tail_ratio"] <= max_response_tail_ratio
+    )
+    result["stability_eligible"] = (
+        result["work_cv_eligible"]
+        & result["work_tail_ratio_eligible"]
+        & result["turns_tail_ratio_eligible"]
+        & result["response_tail_ratio_eligible"]
+    )
+    result["cohort_eligible"] = result["selection_eligible"] & result["stability_eligible"]
+    return result
+
+
+def select_similar_cohort(
+    summary: pd.DataFrame,
+    num_samples: int,
+    pool_size: int,
+    closeness_weight: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    candidates = summary[summary["cohort_eligible"]].sort_values(
+        ["pd_suitability_score", "decode_pressure_proxy_p25"],
+        ascending=[False, False],
+    )
+    candidates = candidates.head(pool_size)
+    if len(candidates) < num_samples:
+        raise ValueError(
+            f"Only {len(candidates)} stable, fully eligible instances are available "
+            f"for a similar cohort of {num_samples}. Inspect stability eligibility "
+            "columns in the report or relax the cohort tail thresholds."
+        )
+
+    combination_count = math.comb(len(candidates), num_samples)
+    if combination_count > 1_000_000:
+        raise ValueError(
+            f"Similar-cohort search would evaluate {combination_count} combinations; "
+            "reduce --cohort-pool-size or --num-samples."
+        )
+
+    # These describe both total service demand and the P/cache shape. Relative
+    # max/min spread makes the resulting four tasks directly comparable.
+    closeness_features = {
+        "total_work_proxy_p50": 0.40,
+        "p_work_proxy_p75": 0.25,
+        "final_context_tokens_p75": 0.20,
+        "num_turns_p50": 0.15,
+    }
+    best_indices: tuple[int, ...] | None = None
+    best_key: tuple[float, float, float, float] | None = None
+    best_stats: dict[str, float] = {}
+    for indices in combinations(candidates.index.tolist(), num_samples):
+        cohort = candidates.loc[list(indices)]
+        spreads = {
+            name: float(cohort[name].max() / max(cohort[name].min(), 1.0) - 1.0)
+            for name in closeness_features
+        }
+        closeness_penalty = sum(
+            closeness_features[name] * spreads[name]
+            for name in closeness_features
+        )
+        mean_score = float(cohort["pd_suitability_score"].mean())
+        min_score = float(cohort["pd_suitability_score"].min())
+        score_quality = 0.70 * mean_score + 0.30 * min_score
+        objective = score_quality - closeness_weight * closeness_penalty
+        key = (objective, mean_score, min_score, -closeness_penalty)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_indices = indices
+            best_stats = {
+                "objective": objective,
+                "score_quality": score_quality,
+                "mean_score": mean_score,
+                "min_score": min_score,
+                "closeness_penalty": closeness_penalty,
+                **{f"spread_{name}": value for name, value in spreads.items()},
+            }
+
+    assert best_indices is not None
+    selected = candidates.loc[list(best_indices)].sort_values(
+        ["pd_suitability_score", "decode_pressure_proxy_p25"],
+        ascending=[False, False],
+    )
+    return selected.copy(), best_stats
+
+
+def _validate_tail_quantile(value: str | float) -> float:
+    number = float(value)
+    if not 0.0 < number <= 1.0:
         raise argparse.ArgumentTypeError("tail quantile must be in (0, 1]")
-    return value
+    return number
+
+
+def _validate_positive(value: str | float) -> float:
+    number = float(value)
+    if number <= 0.0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def _validate_at_least_one(value: str | float) -> float:
+    number = float(value)
+    if number < 1.0:
+        raise argparse.ArgumentTypeError("tail ratio must be at least 1")
+    return number
 
 
 def main() -> None:
@@ -361,6 +499,36 @@ def main() -> None:
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
     parser.add_argument("--report", default="swe_rebench_pd_selection.csv")
     parser.add_argument("--num-samples", type=int, default=64)
+    parser.add_argument(
+        "--similar-cohort",
+        action="store_true",
+        help=(
+            "Jointly select a small, stable group from the highest-scoring "
+            "candidates so their total/P work, context, and turns are similar."
+        ),
+    )
+    parser.add_argument(
+        "--cohort-pool-size",
+        type=int,
+        default=40,
+        help="Highest-scoring stable candidates considered by cohort search (default: 40).",
+    )
+    parser.add_argument(
+        "--cohort-closeness-weight",
+        type=_validate_positive,
+        default=0.20,
+        help="Penalty weight for relative workload spread inside the cohort (default: 0.20).",
+    )
+    parser.add_argument("--max-work-cv", type=_validate_positive, default=0.35)
+    parser.add_argument(
+        "--max-work-tail-ratio", type=_validate_at_least_one, default=1.50
+    )
+    parser.add_argument(
+        "--max-turns-tail-ratio", type=_validate_at_least_one, default=1.50
+    )
+    parser.add_argument(
+        "--max-response-tail-ratio", type=_validate_at_least_one, default=1.50
+    )
     parser.add_argument(
         "--rollout-n",
         type=int,
@@ -395,6 +563,10 @@ def main() -> None:
 
     if args.rollout_n <= 0:
         parser.error("--rollout-n must be greater than zero")
+    if args.num_samples <= 0:
+        parser.error("--num-samples must be greater than zero")
+    if args.cohort_pool_size <= 0:
+        parser.error("--cohort-pool-size must be greater than zero")
 
     dataset = pd.read_parquet(args.input)
     ids = dataset.apply(dataset_instance_id, axis=1)
@@ -420,14 +592,20 @@ def main() -> None:
             "No ROLLOUT_SAMPLE records match instance_id values in the input parquet"
         )
 
-    summary = rank_samples(
-        summarize(records),
-        args.tail_quantile,
-        args.cache_quantile,
-        args.max_turns_quantile,
-        args.rollout_n,
-        args.min_model_prompt_ratio,
-        args.max_turns_mean,
+    summary = mark_stable_candidates(
+        rank_samples(
+            summarize(records),
+            args.tail_quantile,
+            args.cache_quantile,
+            args.max_turns_quantile,
+            args.rollout_n,
+            args.min_model_prompt_ratio,
+            args.max_turns_mean,
+        ),
+        args.max_work_cv,
+        args.max_work_tail_ratio,
+        args.max_turns_tail_ratio,
+        args.max_response_tail_ratio,
     )
 
     scored_input_ids: set[str] = set()
@@ -445,10 +623,32 @@ def main() -> None:
         missing_scored_ids = sorted(scored_input_ids - set(summary["instance_id"]))
     summary["in_score_input"] = summary["instance_id"].isin(scored_input_ids)
 
-    selected_summary = summary[summary["selection_eligible"]].head(args.num_samples).copy()
-    summary["selected"] = summary["rank"].isin(selected_summary["rank"])
+    cohort_stats: dict[str, float] | None = None
+    selection_error: ValueError | None = None
+    if args.similar_cohort:
+        try:
+            selected_summary, cohort_stats = select_similar_cohort(
+                summary,
+                args.num_samples,
+                args.cohort_pool_size,
+                args.cohort_closeness_weight,
+            )
+        except ValueError as exc:
+            selected_summary = summary.iloc[0:0].copy()
+            selection_error = exc
+    else:
+        selected_summary = summary[summary["selection_eligible"]].head(args.num_samples).copy()
+
+    selected_summary["selection_rank"] = range(1, len(selected_summary) + 1)
+    selection_rank = dict(
+        zip(selected_summary["instance_id"], selected_summary["selection_rank"], strict=True)
+    )
+    summary["selected"] = summary["instance_id"].isin(selection_rank)
+    summary["selection_rank"] = summary["instance_id"].map(selection_rank).astype("Int64")
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(args.report, index=False)
+    if selection_error is not None:
+        raise selection_error
     if len(selected_summary) < args.num_samples:
         raise ValueError(
             f"Only {len(selected_summary)} instances satisfy the enabled validity/tail constraints, "
@@ -456,9 +656,8 @@ def main() -> None:
             f"relative candidates; inspect {args.report} eligibility columns or expand the input pool."
         )
 
-    rank = dict(zip(selected_summary["instance_id"], selected_summary["rank"], strict=True))
-    selected = dataset[ids.isin(rank)].copy()
-    selected["_selection_rank"] = ids[ids.isin(rank)].map(rank).to_numpy()
+    selected = dataset[ids.isin(selection_rank)].copy()
+    selected["_selection_rank"] = ids[ids.isin(selection_rank)].map(selection_rank).to_numpy()
     selected = selected.sort_values("_selection_rank").drop(columns="_selection_rank")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -514,6 +713,18 @@ def main() -> None:
         f"Turn-eligible instances: {int(summary['turns_eligible'].sum())} "
         f"(turns mean <= {summary['turns_cutoff'].iloc[0]:g}, {turns_source})"
     )
+    print(
+        f"Stability-eligible instances: {int(summary['stability_eligible'].sum())} "
+        f"(work CV<={args.max_work_cv:g}, max/median: "
+        f"work<={args.max_work_tail_ratio:g}, "
+        f"turns<={args.max_turns_tail_ratio:g}, "
+        f"response<={args.max_response_tail_ratio:g})"
+    )
+    if args.similar_cohort:
+        print(
+            f"Cohort-eligible instances: {int(summary['cohort_eligible'].sum())} "
+            "(fully eligible and stable)"
+        )
     print(f"Fully eligible instances: {int(summary['selection_eligible'].sum())}")
     print(f"Input instances without logs: {len(missing_logged_ids)}")
     if missing_logged_ids:
@@ -538,6 +749,22 @@ def main() -> None:
         "Selected aggregate response:prompt ratio: "
         f"{selected_response_prompt_ratio:.6f}:1"
     )
+    if cohort_stats is not None:
+        print(
+            "Similar-cohort objective: "
+            f"{cohort_stats['objective']:.6f} "
+            f"(score_quality={cohort_stats['score_quality']:.6f}, "
+            f"mean_score={cohort_stats['mean_score']:.6f}, "
+            f"min_score={cohort_stats['min_score']:.6f}, "
+            f"closeness_penalty={cohort_stats['closeness_penalty']:.6f})"
+        )
+        print(
+            "Similar-cohort relative spreads: "
+            f"total_work_p50={cohort_stats['spread_total_work_proxy_p50']:.3f}, "
+            f"p_work_p75={cohort_stats['spread_p_work_proxy_p75']:.3f}, "
+            f"context_p75={cohort_stats['spread_final_context_tokens_p75']:.3f}, "
+            f"turns_p50={cohort_stats['spread_num_turns_p50']:.3f}"
+        )
     if args.score_input:
         scored_summary = summary[summary["in_score_input"]].sort_values(
             ["pd_score_rank_all", "instance_id"], kind="stable"
@@ -572,6 +799,8 @@ def main() -> None:
                     )
                     if not getattr(row, name)
                 ]
+                if args.similar_cohort and not row.stability_eligible:
+                    failed.append("stability")
                 print(
                     f"instance_id={row.instance_id} "
                     f"pd_suitability_score={row.pd_suitability_score:.6f} "
@@ -590,10 +819,14 @@ def main() -> None:
     print(f"Selection report: {args.report}")
     for row in selected_summary.itertuples(index=False):
         print(
-            f"rank={row.rank} instance_id={row.instance_id} "
+            f"selection_rank={row.selection_rank} score_rank={row.rank} "
+            f"instance_id={row.instance_id} "
             f"sessions={row.sessions} trajectories={row.trajectory_records} "
             f"turns_mean={row.num_turns_mean:.1f} turns_p50={row.num_turns_p50:.1f} "
+            f"turns_max={row.num_turns_max:.1f} "
+            f"turns_tail_ratio={row.num_turns_tail_ratio:.3f} "
             f"prompt_mean={row.prompt_tokens_mean:.0f} response_mean={row.response_tokens_mean:.0f} "
+            f"response_tail_ratio={row.response_tokens_tail_ratio:.3f} "
             f"model_mean={row.model_tokens_mean:.0f} non_model_mean={row.non_model_tokens_mean:.0f} "
             f"model_per_turn_mean={row.model_tokens_per_turn:.0f} "
             f"model_per_turn_p25={row.model_tokens_per_turn_p25:.0f} "
@@ -602,6 +835,9 @@ def main() -> None:
             f"p_work_p75={row.p_work_proxy_p75:.0f} "
             f"context_p75={row.final_context_tokens_p75:.0f} "
             f"total_work={row.total_work_proxy_mean:.0f} "
+            f"total_work_p50={row.total_work_proxy_p50:.0f} "
+            f"total_work_cv={row.total_work_proxy_cv:.3f} "
+            f"total_work_tail_ratio={row.total_work_proxy_tail_ratio:.3f} "
             f"decode_pressure={row.decode_pressure_proxy:.3f} "
             f"decode_pressure_p25={row.decode_pressure_proxy_p25:.3f} "
             f"pd_suitability_score={row.pd_suitability_score:.3f} "
