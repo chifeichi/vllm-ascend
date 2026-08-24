@@ -741,7 +741,33 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        partial_rollout_debug_sync(
+            "update_states_pre_super",
+            new_reqs=len(scheduler_output.scheduled_new_reqs),
+            cached_reqs=len(req_data.req_ids),
+            finished_reqs=len(scheduler_output.finished_req_ids),
+            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero),
+        )
+        result = super()._update_states(scheduler_output)
+        partial_rollout_debug_sync(
+            "update_states_post_super",
+            num_reqs=self.input_batch.num_reqs,
+            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero),
+        )
+        return result
+
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        partial_rollout_debug_sync(
+            "kv_block_zero_pre",
+            block_count=len(block_ids),
+            min_block_id=min(block_ids) if block_ids else -1,
+            max_block_id=max(block_ids) if block_ids else -1,
+        )
+        super()._zero_block_ids(block_ids)
+        partial_rollout_debug_sync(
+            "kv_block_zero_post",
+            block_count=len(block_ids),
+        )
 
     def _pad_query_start_loc_for_fia(
         self,

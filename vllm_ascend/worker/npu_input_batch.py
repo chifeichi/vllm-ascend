@@ -17,6 +17,8 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_input_batch.py
 #
 
+from typing import Any
+
 import numpy as np
 import torch
 from vllm.lora.request import LoRARequest
@@ -27,6 +29,7 @@ from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
 
@@ -237,3 +240,29 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def add_request(self, request: Any) -> int:
+        partial_rollout_debug_sync(
+            "input_batch_add_request_pre",
+            req_id=getattr(request, "req_id", "unknown"),
+            num_reqs=self.num_reqs,
+        )
+        req_index = super().add_request(request)
+        partial_rollout_debug_sync(
+            "input_batch_add_request_post",
+            req_id=getattr(request, "req_id", "unknown"),
+            req_index=req_index,
+            num_reqs=self.num_reqs,
+        )
+        return req_index
+
+    def refresh_metadata(self) -> None:
+        partial_rollout_debug_sync(
+            "input_batch_refresh_metadata_pre",
+            num_reqs=self.num_reqs,
+        )
+        super().refresh_metadata()
+        partial_rollout_debug_sync(
+            "input_batch_refresh_metadata_post",
+            num_reqs=self.num_reqs,
+        )
