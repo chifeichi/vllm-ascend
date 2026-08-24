@@ -128,6 +128,7 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
@@ -811,10 +812,20 @@ class NPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        partial_rollout_debug_sync(
+            "prepare_inputs_entry",
+            num_reqs=num_reqs,
+            tokens=total_num_scheduled_tokens,
+        )
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        partial_rollout_debug_sync(
+            "prepare_inputs_post_block_table_copy",
+            num_reqs=num_reqs,
+            tokens=total_num_scheduled_tokens,
+        )
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -1899,6 +1910,11 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        partial_rollout_debug_sync(
+            "model_execute_entry",
+            num_reqs=self.input_batch.num_reqs,
+            tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -1994,6 +2010,11 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                partial_rollout_debug_sync(
+                    "model_execute_post_update_states",
+                    num_reqs=self.input_batch.num_reqs,
+                    tokens=num_scheduled_tokens,
+                )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2037,6 +2058,11 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+                partial_rollout_debug_sync(
+                    "model_execute_pre_prepare_inputs",
+                    num_reqs=num_reqs,
+                    tokens=num_scheduled_tokens,
+                )
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2044,6 +2070,11 @@ class NPUModelRunner(GPUModelRunner):
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
+                )
+                partial_rollout_debug_sync(
+                    "model_execute_post_prepare_inputs",
+                    num_reqs=num_reqs,
+                    tokens=total_num_scheduled_tokens,
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -2175,6 +2206,12 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                partial_rollout_debug_sync(
+                    "model_execute_pre_attention_metadata",
+                    num_reqs=num_reqs,
+                    tokens=num_tokens_unpadded,
+                    tokens_padded=num_tokens_padded,
+                )
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2189,6 +2226,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                )
+                partial_rollout_debug_sync(
+                    "model_execute_post_attention_metadata",
+                    num_reqs=num_reqs,
+                    tokens=num_tokens_unpadded,
+                    tokens_padded=num_tokens_padded,
                 )
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -3184,10 +3227,26 @@ class NPUModelRunner(GPUModelRunner):
                     ))):
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
+                partial_rollout_debug_sync(
+                    "attention_builder_pre_build",
+                    builder=type(builder).__name__,
+                    kv_cache_gid=kv_cache_gid,
+                    attn_gid=attn_gid,
+                    tokens=num_tokens,
+                    num_reqs=num_reqs,
+                )
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
+                )
+                partial_rollout_debug_sync(
+                    "attention_builder_post_build",
+                    builder=type(builder).__name__,
+                    kv_cache_gid=kv_cache_gid,
+                    attn_gid=attn_gid,
+                    tokens=num_tokens,
+                    num_reqs=num_reqs,
                 )
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
