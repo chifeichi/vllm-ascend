@@ -1,5 +1,1 @@
-cd /mnt/share/t00xxxxx/Megatron-LM
-
-git branch --show-current
-git rev-parse --short HEAD
-grep -nE '^(version *=|__version__)' pyproject.toml setup.py megatron/core/package_info.py 2>/dev/null
+grep -aF '[PR_DEBUG]' <日志文件> | grep -F 'pid=1215648 ' | grep -F 'phase=sync_ok' | awk '{for(i=1;i<=NF;i++) if($i~/^time_ns=/){split($i,a,"="); print a[2],$0}}' | sort -n | tail -n 1 | cut -d' ' -f2-
