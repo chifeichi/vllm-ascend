@@ -290,17 +290,18 @@ class NPUInputBatch(InputBatch):
                 num_reqs=self.num_reqs,
             )
 
+        logit_procs = tuple(self.logitsprocs.all)
         partial_rollout_debug_sync(
             "input_batch_logitsprocs_pre_update",
             num_reqs=self.num_reqs,
-            processor_count=len(self.logitsprocs.all),
+            processor_count=len(logit_procs),
         )
-        for logit_proc in self.logitsprocs.all:
+        for logit_proc in logit_procs:
             logit_proc.update_state(batch_update)
         partial_rollout_debug_sync(
             "input_batch_logitsprocs_post_update",
             num_reqs=self.num_reqs,
-            processor_count=len(self.logitsprocs.all),
+            processor_count=len(logit_procs),
         )
 
         if batch_update:
