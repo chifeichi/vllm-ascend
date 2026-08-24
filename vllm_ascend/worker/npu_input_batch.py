@@ -261,7 +261,60 @@ class NPUInputBatch(InputBatch):
             "input_batch_refresh_metadata_pre",
             num_reqs=self.num_reqs,
         )
-        super().refresh_metadata()
+
+        if self.is_pooling_model:
+            batch_changed = self.batch_update_builder.reset()
+            if batch_changed:
+                partial_rollout_debug_sync(
+                    "input_batch_sampling_metadata_pre_build",
+                    num_reqs=self.num_reqs,
+                    pooling=True,
+                )
+                self.sampling_metadata = self._make_sampling_metadata()
+                partial_rollout_debug_sync(
+                    "input_batch_sampling_metadata_post_build",
+                    num_reqs=self.num_reqs,
+                    pooling=True,
+                )
+            return
+
+        batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
+        if self.thinking_budget_state_holder is not None and batch_update:
+            partial_rollout_debug_sync(
+                "input_batch_thinking_budget_pre_sync",
+                num_reqs=self.num_reqs,
+            )
+            self.thinking_budget_state_holder.sync_batch(batch_update)
+            partial_rollout_debug_sync(
+                "input_batch_thinking_budget_post_sync",
+                num_reqs=self.num_reqs,
+            )
+
+        partial_rollout_debug_sync(
+            "input_batch_logitsprocs_pre_update",
+            num_reqs=self.num_reqs,
+            processor_count=len(self.logitsprocs.all),
+        )
+        for logit_proc in self.logitsprocs.all:
+            logit_proc.update_state(batch_update)
+        partial_rollout_debug_sync(
+            "input_batch_logitsprocs_post_update",
+            num_reqs=self.num_reqs,
+            processor_count=len(self.logitsprocs.all),
+        )
+
+        if batch_update:
+            partial_rollout_debug_sync(
+                "input_batch_sampling_metadata_pre_build",
+                num_reqs=self.num_reqs,
+                pooling=False,
+            )
+            self.sampling_metadata = self._make_sampling_metadata()
+            partial_rollout_debug_sync(
+                "input_batch_sampling_metadata_post_build",
+                num_reqs=self.num_reqs,
+                pooling=False,
+            )
         partial_rollout_debug_sync(
             "input_batch_refresh_metadata_post",
             num_reqs=self.num_reqs,
