@@ -1,1 +1,1 @@
-grep -aF '[PR_DEBUG]' <日志文件> | grep -F 'pid=1711545 ' | grep -F 'phase=sync_ok' | awk '{for(i=1;i<=NF;i++) if($i~/^time_ns=/){split($i,a,"="); print a[2],$0}}' | sort -n | tail -n 1 | cut -d' ' -f2-
+grep -aF '[PR_DEBUG]' <日志文件> | grep -F 'pid=1711545 ' | grep -F 'phase=before_sync' | awk '{for(i=1;i<=NF;i++) if($i~/^time_ns=/){split($i,a,"="); print a[2],$0}}' | sort -n | tail -n 2 | head -n 1 | cut -d' ' -f2-
