@@ -39,6 +39,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -197,6 +198,25 @@ def _build_non_spec_chunked_prefill_metadata(
 
     cu_seqlens_host = tuple(cu_seqlens_cpu.to(torch.int64).reshape(-1).tolist())
     num_decodes = sum(1 for seq_start, seq_end in zip(cu_seqlens_host, cu_seqlens_host[1:]) if seq_end - seq_start == 1)
+    metadata_numel = sum(
+        tensor.numel()
+        for tensor in (
+            chunk_indices_chunk64,
+            chunk_offsets_chunk64,
+            update_chunk_offsets_chunk64,
+            final_chunk_indices_chunk64,
+            chunk_indices_large_block,
+            block_indices_cumsum,
+        )
+    )
+    partial_rollout_debug_sync(
+        "gdn_metadata_pre_h2d",
+        target_device=device,
+        sequences=max(len(cu_seqlens_host) - 1, 0),
+        tokens=cu_seqlens_host[-1] if cu_seqlens_host else 0,
+        num_decodes=num_decodes,
+        metadata_numel=metadata_numel,
+    )
     # Pre-compute compact cu_seqlens for AscendC kernels so each layer
     # can reuse them instead of calling _compact_empty_segments again.
     cu_seqlens_kern, _, keep_meta = _compact_empty_segments(cu_seqlens_host, None, device=device)
@@ -205,15 +225,30 @@ def _build_non_spec_chunked_prefill_metadata(
     else:
         cu_seqlens_kern = tuple(cu_seqlens_kern)
 
+    chunk_indices_chunk64_device = chunk_indices_chunk64.to(device=device, non_blocking=True)
+    chunk_offsets_chunk64_device = chunk_offsets_chunk64.to(device=device, non_blocking=True)
+    update_chunk_offsets_chunk64_device = update_chunk_offsets_chunk64.to(device=device, non_blocking=True)
+    final_chunk_indices_chunk64_device = final_chunk_indices_chunk64.to(device=device, non_blocking=True)
+    chunk_indices_large_block_device = chunk_indices_large_block.to(device=device, non_blocking=True)
+    block_indices_cumsum_device = block_indices_cumsum.to(device=device, non_blocking=True)
+    partial_rollout_debug_sync(
+        "gdn_metadata_post_h2d",
+        target_device=device,
+        sequences=max(len(cu_seqlens_host) - 1, 0),
+        tokens=cu_seqlens_host[-1] if cu_seqlens_host else 0,
+        num_decodes=num_decodes,
+        metadata_numel=metadata_numel,
+    )
+
     return GDNChunkedPrefillMetadata(
         cu_seqlens_host=cu_seqlens_host,
         chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
-        chunk_indices_chunk64=chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_offsets_chunk64=chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        final_chunk_indices_chunk64=final_chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_indices_large_block=chunk_indices_large_block.to(device=device, non_blocking=True),
-        block_indices_cumsum=block_indices_cumsum.to(device=device, non_blocking=True),
+        chunk_indices_chunk64=chunk_indices_chunk64_device,
+        chunk_offsets_chunk64=chunk_offsets_chunk64_device,
+        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64_device,
+        final_chunk_indices_chunk64=final_chunk_indices_chunk64_device,
+        chunk_indices_large_block=chunk_indices_large_block_device,
+        block_indices_cumsum=block_indices_cumsum_device,
         num_decodes=num_decodes,
         cu_seqlens_kern=cu_seqlens_kern,
         keep_meta=keep_meta,

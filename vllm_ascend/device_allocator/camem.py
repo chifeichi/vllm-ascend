@@ -27,6 +27,8 @@ import torch
 from acl.rt import memcpy  # type: ignore # noqa: F401
 from vllm.logger import logger
 
+from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
+
 
 def find_loaded_library(lib_name) -> str | None:
     """
@@ -201,6 +203,18 @@ class CaMemAllocator:
             len(self.pointer_to_data),
             offload_tags,
         )
+        total_bytes = sum(data.handle[1] for data in self.pointer_to_data.values())
+        offload_bytes = sum(
+            data.handle[1] for data in self.pointer_to_data.values() if data.tag in offload_tags
+        )
+        partial_rollout_debug_sync(
+            "camem_sleep_pre_unmap",
+            allocations=len(self.pointer_to_data),
+            total_bytes=total_bytes,
+            offload_count=offload_count,
+            offload_bytes=offload_bytes,
+            tags=offload_tags,
+        )
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
                 # This memory is not offloaded or released during sleep.
@@ -218,6 +232,12 @@ class CaMemAllocator:
 
         gc.collect()
         torch.npu.empty_cache()
+        partial_rollout_debug_sync(
+            "camem_sleep_post_unmap",
+            allocations=len(self.pointer_to_data),
+            total_bytes=total_bytes,
+            offload_count=offload_count,
+        )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """
@@ -230,6 +250,16 @@ class CaMemAllocator:
             restore_count,
             len(self.pointer_to_data),
             tags or "all",
+        )
+        restore_bytes = sum(
+            data.handle[1] for data in self.pointer_to_data.values() if tags is None or data.tag in tags
+        )
+        partial_rollout_debug_sync(
+            "camem_wake_pre_remap",
+            allocations=len(self.pointer_to_data),
+            restore_count=restore_count,
+            restore_bytes=restore_bytes,
+            tags=tags or "all",
         )
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
@@ -247,6 +277,12 @@ class CaMemAllocator:
                         dest_max = ptr + size_in_bytes * 2
                         memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
                         data.cpu_backup_tensor = None
+        partial_rollout_debug_sync(
+            "camem_wake_post_remap",
+            allocations=len(self.pointer_to_data),
+            restore_count=restore_count,
+            restore_bytes=restore_bytes,
+        )
 
     @contextmanager
     def use_allocation_tag(self, tag: str):
