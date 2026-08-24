@@ -746,13 +746,13 @@ class NPUModelRunner(GPUModelRunner):
             new_reqs=len(scheduler_output.scheduled_new_reqs),
             cached_reqs=len(req_data.req_ids),
             finished_reqs=len(scheduler_output.finished_req_ids),
-            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero),
+            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero or []),
         )
         result = super()._update_states(scheduler_output)
         partial_rollout_debug_sync(
             "update_states_post_super",
             num_reqs=self.input_batch.num_reqs,
-            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero),
+            blocks_to_zero=len(scheduler_output.new_block_ids_to_zero or []),
         )
         return result
 
