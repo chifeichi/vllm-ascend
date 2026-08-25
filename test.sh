@@ -1,1 +1,1 @@
-grep -aF 'stage=model_execute_post_update_states phase=sync_failed' <日志文件> | grep -F 'pid=1711545 ' | tail -n 1
+strings <日志文件> | grep -E 'input_batch_(thinking_budget|logitsprocs|sampling_metadata|refresh_metadata).*phase=sync_failed' | tail -1
