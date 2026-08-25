@@ -15,7 +15,33 @@
 
 from __future__ import annotations
 
+import os
+import time
+from typing import Any
+
+from vllm.logger import init_logger
 from vllm.v1.engine.core import EngineCore
+
+logger = init_logger(__name__)
+
+
+def _debug_wake(stage: str, **details: Any) -> None:
+    if os.environ.get("PARTIAL_ROLLOUT_DEBUG_SYNC", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    logger.warning(
+        "[PR_DEBUG] stage=%s time_ns=%s pid=%s replica_rank=%s %s",
+        stage,
+        time.time_ns(),
+        os.getpid(),
+        os.environ.get("VERL_REPLICA_RANK", "unknown"),
+        detail_text,
+    )
 
 
 def _wake_up_without_early_scheduler_resume(
@@ -32,15 +58,57 @@ def _wake_up_without_early_scheduler_resume(
     Preserve the explicit ``scheduling`` wake behavior, but otherwise resume
     only after the executor reports that no allocation tags remain asleep.
     """
+    sleeping_tags_before = getattr(self.model_executor, "sleeping_tags", "unknown")
+    _debug_wake(
+        "engine_core_wake_entry",
+        tags=tags or "all",
+        executor_is_sleeping=self.model_executor.is_sleeping,
+        sleeping_tags=sleeping_tags_before,
+    )
+
     resume_scheduling = tags is not None and "scheduling" in tags
     if resume_scheduling:
         tags = [tag for tag in tags if tag != "scheduling"]
 
     if tags is None or tags:
-        self.model_executor.wake_up(tags)
+        _debug_wake(
+            "engine_core_wake_pre_executor",
+            tags=tags or "all",
+            sleeping_tags=getattr(self.model_executor, "sleeping_tags", "unknown"),
+        )
+        try:
+            self.model_executor.wake_up(tags)
+        except Exception:
+            logger.exception(
+                "[PR_DEBUG] stage=engine_core_wake_executor_failed "
+                "time_ns=%s pid=%s replica_rank=%s tags=%s sleeping_tags=%s",
+                time.time_ns(),
+                os.getpid(),
+                os.environ.get("VERL_REPLICA_RANK", "unknown"),
+                tags or "all",
+                getattr(self.model_executor, "sleeping_tags", "unknown"),
+            )
+            raise
+        _debug_wake(
+            "engine_core_wake_post_executor",
+            tags=tags or "all",
+            executor_is_sleeping=self.model_executor.is_sleeping,
+            sleeping_tags=getattr(self.model_executor, "sleeping_tags", "unknown"),
+        )
 
     if resume_scheduling or not self.model_executor.is_sleeping:
+        _debug_wake(
+            "engine_core_wake_resume_scheduler",
+            tags=tags or "all",
+            explicit_scheduling=resume_scheduling,
+        )
         self.resume_scheduler()
+    else:
+        _debug_wake(
+            "engine_core_wake_keep_scheduler_paused",
+            tags=tags or "all",
+            sleeping_tags=getattr(self.model_executor, "sleeping_tags", "unknown"),
+        )
 
 
 EngineCore.wake_up = _wake_up_without_early_scheduler_resume
