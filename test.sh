@@ -1,1 +1,1 @@
-strings <日志文件> | grep 'pid=36726' | grep -E 'stage=(worker_wake_(entry|exit)|sampling_metadata_temperature_post)' | tail -8
+python -c 'import traceback; import fla; print("fla:",fla.__file__); exec("try:\n import fla_npu\n print(\"fla_npu: OK\",fla_npu.__file__)\nexcept Exception:\n traceback.print_exc()\ntry:\n from fla.modules.convolution import causal_conv1d\n print(\"causal_conv1d: OK\",causal_conv1d)\nexcept Exception:\n traceback.print_exc()")'
