@@ -1,1 +1,1 @@
-strings <日志文件> | grep -E 'input_batch_(thinking_budget|logitsprocs|sampling_metadata|refresh_metadata).*phase=sync_failed' | tail -1
+strings <日志文件> | grep 'pid=36726' | grep -E 'stage=(worker_wake_(entry|exit)|sampling_metadata_temperature_post)' | tail -8
