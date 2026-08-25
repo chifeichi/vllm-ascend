@@ -29,7 +29,6 @@ from vllm.logger import logger
 from vllm.utils.mem_constants import GiB_bytes
 
 from vllm_ascend.compilation import acl_graph
-from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
 
 
 class SleepWakeupManager:
@@ -59,15 +58,10 @@ class SleepWakeupManager:
         )
 
     def wakeup(self, tags: list[str] | None = None) -> None:
-        debug_tags = tags or "all"
-        partial_rollout_debug_sync("sleep_manager_pre_hccl_wakeup", tags=debug_tags)
         self.hccl.wakeup()
-        partial_rollout_debug_sync("sleep_manager_post_hccl_wakeup", tags=debug_tags)
         model_runner = self._model_runner_getter()
         if model_runner.use_aclgraph:
-            partial_rollout_debug_sync("sleep_manager_pre_aclgraph_wakeup", tags=debug_tags)
             self.acl_graph.wakeup(tags)
-            partial_rollout_debug_sync("sleep_manager_post_aclgraph_wakeup", tags=debug_tags)
 
 
 class AclGraphSleepWakeupManager:
@@ -130,10 +124,8 @@ class AclGraphSleepWakeupManager:
             # recapture graphs only after KV cache is restored.
             return
         model_runner = self._model_runner_getter()
-        partial_rollout_debug_sync("aclgraph_pre_capture_model", tags=tags or "all")
         with set_current_vllm_config(self.vllm_config):
             model_runner.capture_model()
-        partial_rollout_debug_sync("aclgraph_post_capture_model", tags=tags or "all")
 
 
 class HcclSleepWakeupManager:
@@ -188,10 +180,7 @@ class HcclSleepWakeupManager:
                 logger.info("Destroyed %d HCCL process groups for sleep mode.", num_destroyed)
 
     def wakeup(self) -> None:
-        partial_rollout_debug_sync("hccl_pre_restore")
         with set_current_vllm_config(self.vllm_config):
             num_restored = self.restore_hccl()
-            partial_rollout_debug_sync("hccl_post_restore", num_restored=num_restored)
             self.refresh_moe_hccl_groups()
-            partial_rollout_debug_sync("hccl_post_refresh_moe_groups", num_restored=num_restored)
         logger.info("Restored %d HCCL process groups after sleep mode.", num_restored)

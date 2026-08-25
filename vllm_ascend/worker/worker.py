@@ -65,7 +65,6 @@ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.partial_rollout_debug import partial_rollout_debug_sync
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -247,8 +246,6 @@ class NPUWorker(WorkerBase):
         global_te.disconnect_all_peers()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        debug_tags = tags or "all"
-        partial_rollout_debug_sync("worker_wake_entry", tags=debug_tags)
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
             raise ValueError(
@@ -257,15 +254,11 @@ class NPUWorker(WorkerBase):
             )
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
-        partial_rollout_debug_sync("worker_wake_post_camem", tags=debug_tags)
         if tags is None or "kv_cache" in tags:
-            partial_rollout_debug_sync("worker_wake_pre_reregister", tags=debug_tags)
             global_te.reregister_buffer()
-            partial_rollout_debug_sync("worker_wake_post_reregister", tags=debug_tags)
 
         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
-        transposed_weight_count = 0
         if self.vllm_config.quant_config is None and (tags is None or "weights" in tags):
             for name, param in model.named_parameters():
                 if "w2_weight" in name and param.shape[2] == hidden_size:
@@ -276,7 +269,6 @@ class NPUWorker(WorkerBase):
                     w2_data = param.transpose(1, 2)
                     w2_data = torch.nn.Parameter(w2_data, requires_grad=False)
                     setattr(parent_module, param_name, w2_data)
-                    transposed_weight_count += 1
                 elif "w13_weight" in name and param.shape[1] == hidden_size:
                     parts = name.split(".")
                     param_name = parts[-1]
@@ -285,12 +277,6 @@ class NPUWorker(WorkerBase):
                     w13_data = param.transpose(1, 2)
                     w13_data = torch.nn.Parameter(w13_data, requires_grad=False)
                     setattr(parent_module, param_name, w13_data)
-                    transposed_weight_count += 1
-        partial_rollout_debug_sync(
-            "worker_wake_post_weight_restore",
-            tags=debug_tags,
-            transposed_weight_count=transposed_weight_count,
-        )
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
@@ -300,14 +286,7 @@ class NPUWorker(WorkerBase):
             self._sleep_saved_buffers = {}
         cleanup_enabled = getattr(get_ascend_config(), "enable_sleep_mode_extra_cleanup", False)
         if cleanup_enabled:
-            partial_rollout_debug_sync("worker_wake_pre_extra_cleanup", tags=debug_tags)
             self.sleep_wakeup_manager.wakeup(tags)
-            partial_rollout_debug_sync("worker_wake_post_extra_cleanup", tags=debug_tags)
-        partial_rollout_debug_sync(
-            "worker_wake_exit",
-            tags=debug_tags,
-            cleanup_enabled=cleanup_enabled,
-        )
 
     def _check_weight_transfer_engine(self) -> None:
         if self.weight_transfer_engine is None:
