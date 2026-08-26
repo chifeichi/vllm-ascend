@@ -50,16 +50,10 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
     import torch.nn.functional as functional
     import torch_npu  # noqa: F401 - registers the NPU backend
 
-    try:
-        import fla_npu  # noqa: F401 - registers FLA Ascend operators
-    except ImportError as exc:
-        raise RuntimeError(
-            "fla_npu cannot be imported; flash-linear-attention-npu is not active"
-        ) from exc
-
     # Activate the same MindSpeed patch path used by Megatron workers.  The
     # separate MegatronAdaptor package exists in the newer stack; core_r0.16.0
-    # uses mindspeed.megatron_adaptor instead.
+    # uses mindspeed.megatron_adaptor instead. Do not import fla_npu before this:
+    # core_r0.16.0 imports the FLA callable first and fla_npu second.
     try:
         import megatron_adaptor  # noqa: F401
     except ImportError:
@@ -138,6 +132,7 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
         f"ACTIVE_GDN_CLASS={inspect.getfile(GatedDeltaNet)} "
         f"GDN_CALLABLE={inspect.getfile(chunk_gated_delta_rule)} "
         f"HAVE_FLA={mindspeed_gdn.HAVE_FLA} "
+        f"HAVE_FLA_NPU={mindspeed_gdn.causal_conv1d is not None} "
         f"MINDSPEED_REV={_git_revision(inspect.getfile(mindspeed_gdn))}",
         flush=True,
     )
