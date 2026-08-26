@@ -104,14 +104,22 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
     q = randn(batch, total_tokens, heads, key_dim)
     k = randn(batch, total_tokens, heads, key_dim)
     v = randn(batch, total_tokens, heads, value_dim)
-    q = functional.normalize(q.float(), dim=-1).to(dtype).detach().requires_grad_(requires_grad)
-    k = functional.normalize(k.float(), dim=-1).to(dtype).detach().requires_grad_(requires_grad)
-    g = (-torch.rand(batch, total_tokens, heads, device=device)).requires_grad_(
-        requires_grad
-    )
-    beta = torch.rand(
-        batch, total_tokens, heads, device=device, dtype=dtype
-    ).requires_grad_(requires_grad)
+    # Match MindSpeed GatedDeltaNet._prepare_qkv_for_gated_delta_rule(): q/k
+    # are normalized by FLA first, then all operator inputs are contiguous.
+    q = mindspeed_gdn.l2norm(q.contiguous()).detach().requires_grad_(requires_grad)
+    k = mindspeed_gdn.l2norm(k.contiguous()).detach().requires_grad_(requires_grad)
+    v = v.contiguous().detach().requires_grad_(requires_grad)
+
+    # Match GatedDeltaNet._compute_g_and_beta(), including g being promoted to
+    # fp32 by alpha.float() while beta remains in the model dtype.
+    alpha = torch.randn(batch, total_tokens, heads, device=device, dtype=dtype)
+    a_log = torch.rand(heads, device=device, dtype=dtype) * 15 + 1
+    a_log = a_log.log()
+    dt_bias = torch.ones(heads, device=device, dtype=dtype)
+    g = (-a_log.exp() * functional.softplus(alpha.float() + dt_bias)).contiguous()
+    g = g.detach().requires_grad_(requires_grad)
+    beta = torch.randn(batch, total_tokens, heads, device=device, dtype=dtype)
+    beta = beta.sigmoid().contiguous().detach().requires_grad_(requires_grad)
 
     offsets = [0]
     for length in case.lengths:
@@ -144,7 +152,6 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
         output_final_state=False,
         use_qk_l2norm_in_kernel=False,
         cu_seqlens=cu_seqlens,
-        chunk_size=64,
     )
     torch.npu.synchronize()
 
