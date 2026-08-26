@@ -142,6 +142,7 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
         flush=True,
     )
 
+    print(f"CASE={case.name} phase=pre_gdn_call", flush=True)
     output, final_state = chunk_gated_delta_rule(
         q,
         k,
@@ -153,7 +154,9 @@ def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
         use_qk_l2norm_in_kernel=False,
         cu_seqlens=cu_seqlens,
     )
+    print(f"CASE={case.name} phase=post_gdn_call_pre_sync", flush=True)
     torch.npu.synchronize()
+    print(f"CASE={case.name} phase=post_gdn_sync", flush=True)
 
     expected_shape = (batch, total_tokens, heads, value_dim)
     if tuple(output.shape) != expected_shape:
