@@ -1,63 +1,3 @@
-mkdir -p /opt/qwen35-thd
-cd /opt/qwen35-thd
-
-git clone --depth 1 -b core_v0.18.0 \
-  https://github.com/NVIDIA/Megatron-LM.git
-
-git clone --depth 1 -b core_r0.18.0 \
-  https://gitcode.com/Ascend/MegatronAdaptor.git
-
-git clone --depth 1 \
-  https://gitcode.com/Ascend/TransformerEngineNPU.git
-
-git clone --depth 1 -b core_r0.18.0 \
-  https://gitcode.com/Ascend/MindSpeed.git
-
-git clone --depth 1 -b v0.5.0 \
-  https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-
-git clone --depth 1 \
-  https://gitcode.com/Ascend/MindSpeed-Ops.git
-
-git clone --depth 1 \
-  https://gitcode.com/Ascend/MindSpeed-Bridge.git
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-pip uninstall -y \
-  megatron-core megatron-bridge \
-  mindspeed megatron-adaptor \
-  transformer-engine mindspeed-ops mindspeed-bridge
-
-pip install decorator pybind11 diffusers
-
-cd /opt/qwen35-thd/Megatron-LM
-pip install -e . --no-deps
-
-cd /opt/qwen35-thd/MegatronAdaptor
-pip install -e . --no-deps
-
-cd /opt/qwen35-thd/TransformerEngineNPU
-pip install -e . --no-deps
-
-cd /opt/qwen35-thd/MindSpeed
-pip install -e . --no-deps
-
-cd /opt/qwen35-thd/Megatron-Bridge
-pip install -e . --no-deps
-
-cd /opt/qwen35-thd/MindSpeed-Ops
-pip install -e . \
-  --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple \
-  --no-build-isolation --no-deps
-
-cd /opt/qwen35-thd/MindSpeed-Bridge
-pip install -e . --no-deps
-
-
-
-
 #!/usr/bin/env python3
 """NPU smoke test for Qwen3.5-35B packed (THD) GDN kernels.
 
@@ -74,6 +14,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -89,7 +30,22 @@ CASES = {
 }
 
 
-def _run_case(case: Case, device_id: int) -> None:
+def _git_revision(source_file: str) -> str:
+    path = Path(source_file).resolve().parent
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            result = subprocess.run(
+                ["git", "-C", str(candidate), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+    return "unknown"
+
+
+def _run_case(case: Case, device_id: int, tp_size: int, cp_size: int) -> None:
     import torch
     import torch.nn.functional as functional
     import torch_npu  # noqa: F401 - registers the NPU backend
@@ -101,7 +57,18 @@ def _run_case(case: Case, device_id: int) -> None:
             "fla_npu cannot be imported; flash-linear-attention-npu is not active"
         ) from exc
 
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    # Activate the same MindSpeed patch path used by Megatron workers.  The
+    # separate MegatronAdaptor package exists in the newer stack; core_r0.16.0
+    # uses mindspeed.megatron_adaptor instead.
+    try:
+        import megatron_adaptor  # noqa: F401
+    except ImportError:
+        import mindspeed.megatron_adaptor  # noqa: F401
+
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    chunk_gated_delta_rule = mindspeed_gdn.chunk_gated_delta_rule
 
     signature = inspect.signature(chunk_gated_delta_rule)
     if "cu_seqlens" not in signature.parameters:
@@ -115,10 +82,15 @@ def _run_case(case: Case, device_id: int) -> None:
     torch.manual_seed(1234)
 
     # Qwen3.5-35B-A3B uses 32 value heads. Its 16 key heads are repeated to 32
-    # before GDN, and both the key and value head dimensions are 128.
+    # before GDN. TP first shards the heads, then MindSpeed's CP->HP all-to-all
+    # trades another CP factor of heads for the full packed sequence.
     batch = 1
     total_tokens = sum(case.lengths)
-    heads = 32
+    if 32 % (tp_size * cp_size) != 0:
+        raise ValueError(
+            f"32 value heads are not divisible by TP*CP={tp_size * cp_size}"
+        )
+    heads = 32 // (tp_size * cp_size)
     key_dim = 128
     value_dim = 128
     dtype = torch.bfloat16
@@ -132,6 +104,8 @@ def _run_case(case: Case, device_id: int) -> None:
     q = randn(batch, total_tokens, heads, key_dim)
     k = randn(batch, total_tokens, heads, key_dim)
     v = randn(batch, total_tokens, heads, value_dim)
+    q = functional.normalize(q.float(), dim=-1).to(dtype).detach().requires_grad_(requires_grad)
+    k = functional.normalize(k.float(), dim=-1).to(dtype).detach().requires_grad_(requires_grad)
     g = (-torch.rand(batch, total_tokens, heads, device=device)).requires_grad_(
         requires_grad
     )
@@ -142,16 +116,21 @@ def _run_case(case: Case, device_id: int) -> None:
     offsets = [0]
     for length in case.lengths:
         offsets.append(offsets[-1] + length)
-    cu_seqlens = torch.tensor(offsets, device=device, dtype=torch.int64)
+    # VERL's preprocess_thd_engine creates cu_seqlens_padded as int32.
+    cu_seqlens = torch.tensor(offsets, device=device, dtype=torch.int32)
 
     print(
         f"CASE={case.name} phase=start lengths={list(case.lengths)} "
         f"total_tokens={total_tokens} q_shape={tuple(q.shape)} "
-        f"cu_seqlens={offsets} backward={case.backward}",
+        f"cu_seqlens={offsets} cu_dtype={cu_seqlens.dtype} "
+        f"tp={tp_size} cp={cp_size} local_heads={heads} backward={case.backward}",
         flush=True,
     )
     print(
-        f"GDN_SOURCE={inspect.getfile(chunk_gated_delta_rule)}",
+        f"ACTIVE_GDN_CLASS={inspect.getfile(GatedDeltaNet)} "
+        f"GDN_CALLABLE={inspect.getfile(chunk_gated_delta_rule)} "
+        f"HAVE_FLA={mindspeed_gdn.HAVE_FLA} "
+        f"MINDSPEED_REV={_git_revision(inspect.getfile(mindspeed_gdn))}",
         flush=True,
     )
 
@@ -163,10 +142,9 @@ def _run_case(case: Case, device_id: int) -> None:
         beta=beta,
         initial_state=None,
         output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=False,
         cu_seqlens=cu_seqlens,
         chunk_size=64,
-        head_first=False,
     )
     torch.npu.synchronize()
 
@@ -194,7 +172,7 @@ def _run_case(case: Case, device_id: int) -> None:
         print(f"CASE={case.name} phase=backward PASS", flush=True)
 
 
-def _run_suite(device_id: int, skip_long: bool) -> int:
+def _run_suite(device_id: int, skip_long: bool, tp_size: int, cp_size: int) -> int:
     selected = ["short"] if skip_long else ["short", "long69632"]
     failed = []
     script = os.path.abspath(__file__)
@@ -207,6 +185,10 @@ def _run_suite(device_id: int, skip_long: bool) -> int:
             name,
             "--device",
             str(device_id),
+            "--tp",
+            str(tp_size),
+            "--cp",
+            str(cp_size),
         ]
         print(f"\n===== RUN {name} =====", flush=True)
         result = subprocess.run(command, check=False)
@@ -225,6 +207,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=sorted(CASES))
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--cp", type=int, default=4)
     parser.add_argument(
         "--skip-long",
         action="store_true",
@@ -233,10 +217,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.case:
-        _run_case(CASES[args.case], args.device)
+        _run_case(CASES[args.case], args.device, args.tp, args.cp)
         print(f"CASE={args.case} RESULT=PASS", flush=True)
         return 0
-    return _run_suite(args.device, args.skip_long)
+    return _run_suite(args.device, args.skip_long, args.tp, args.cp)
 
 
 if __name__ == "__main__":
