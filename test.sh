@@ -56,6 +56,8 @@ cd /opt/qwen35-thd/MindSpeed-Bridge
 pip install -e . --no-deps
 
 
+
+
 #!/usr/bin/env python3
 """NPU smoke test for Qwen3.5-35B packed (THD) GDN kernels.
 
@@ -152,3 +154,90 @@ def _run_case(case: Case, device_id: int) -> None:
         f"GDN_SOURCE={inspect.getfile(chunk_gated_delta_rule)}",
         flush=True,
     )
+
+    output, final_state = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        chunk_size=64,
+        head_first=False,
+    )
+    torch.npu.synchronize()
+
+    expected_shape = (batch, total_tokens, heads, value_dim)
+    if tuple(output.shape) != expected_shape:
+        raise AssertionError(
+            f"unexpected output shape: {tuple(output.shape)} != {expected_shape}"
+        )
+    if final_state is not None:
+        raise AssertionError("final_state must be None when output_final_state=False")
+    if not bool(torch.isfinite(output).all().item()):
+        raise AssertionError("GDN forward produced NaN or Inf")
+
+    print(f"CASE={case.name} phase=forward PASS", flush=True)
+
+    if case.backward:
+        loss = functional.mse_loss(output.float(), torch.zeros_like(output.float()))
+        loss.backward()
+        torch.npu.synchronize()
+        for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
+            if tensor.grad is None:
+                raise AssertionError(f"{name}.grad is None")
+            if not bool(torch.isfinite(tensor.grad).all().item()):
+                raise AssertionError(f"{name}.grad contains NaN or Inf")
+        print(f"CASE={case.name} phase=backward PASS", flush=True)
+
+
+def _run_suite(device_id: int, skip_long: bool) -> int:
+    selected = ["short"] if skip_long else ["short", "long69632"]
+    failed = []
+    script = os.path.abspath(__file__)
+
+    for name in selected:
+        command = [
+            sys.executable,
+            script,
+            "--case",
+            name,
+            "--device",
+            str(device_id),
+        ]
+        print(f"\n===== RUN {name} =====", flush=True)
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            failed.append((name, result.returncode))
+
+    if failed:
+        print(f"\nTHD_GDN_RESULT=FAIL failed_cases={failed}", flush=True)
+        return 1
+
+    print("\nTHD_GDN_RESULT=PASS", flush=True)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--case", choices=sorted(CASES))
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--skip-long",
+        action="store_true",
+        help="Only run the short forward/backward THD case",
+    )
+    args = parser.parse_args()
+
+    if args.case:
+        _run_case(CASES[args.case], args.device)
+        print(f"CASE={args.case} RESULT=PASS", flush=True)
+        return 0
+    return _run_suite(args.device, args.skip_long)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
