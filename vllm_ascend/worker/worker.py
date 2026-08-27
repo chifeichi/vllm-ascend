@@ -264,6 +264,10 @@ class NPUWorker(WorkerBase):
             used_bytes / GiB_bytes,
         )
 
+    def disconnect_kv_transfer_peers(self) -> None:
+        """Compatibility no-op when Mooncake short connections are enabled."""
+        return
+
     def wake_up(self, tags: list[str] | None = None) -> None:
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
