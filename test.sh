@@ -1,1 +1,1 @@
-for f in /xxx/cann-9.1.0/python/site-packages/mooncake/{engine.cpython-311-aarch64-linux-gpu.so,libtransfer_engine.so,ascend_transport.so}; do echo "=== $f"; strings "$f" | grep -m3 -E 'Mooncake|mooncake-transfer-engine'; done
+python -c 'import mooncake.engine; print("".join(x for x in open("/proc/self/maps") if any(k in x for k in ("mooncake/", "transfer_engine", "ascend_transport"))))'
