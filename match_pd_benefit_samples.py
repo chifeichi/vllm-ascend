@@ -6,7 +6,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from select_pd_benefit_samples import parse_logs, rank_samples, summarize
+from select_pd_benefit_samples import (
+    dataset_instance_id,
+    parse_logs,
+    rank_samples,
+    summarize,
+)
 
 
 FEATURES = {
@@ -52,6 +57,27 @@ def load_candidates(paths: list[str], rollout_n: int) -> tuple[pd.DataFrame, pd.
         summary["rollout_n_eligible"] & summary["trajectory_eligible"]
     ].copy()
     return records, candidates
+
+
+def load_dataset(path: str) -> pd.DataFrame:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".parquet":
+        return pd.read_parquet(path)
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError("--input must be a .parquet or .csv file")
+
+
+def save_dataset(frame: pd.DataFrame, path: str) -> None:
+    suffix = Path(path).suffix.lower()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if suffix == ".parquet":
+        frame.to_parquet(path, index=False)
+        return
+    if suffix == ".csv":
+        frame.to_csv(path, index=False)
+        return
+    raise ValueError("--dataset-output must end in .parquet or .csv")
 
 
 def validate_columns(reference: pd.DataFrame, candidates: pd.DataFrame) -> list[str]:
@@ -179,9 +205,15 @@ def main() -> None:
         required=True,
         help="New-version logs containing ROLLOUT_SAMPLE records",
     )
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="New-version candidate dataset in parquet or CSV format",
+    )
     parser.add_argument("--rollout-n", type=int, default=4)
     parser.add_argument("--output", default="matched_pd_selection.csv")
     parser.add_argument("--comparison", default="matched_pd_distribution.csv")
+    parser.add_argument("--dataset-output", default="matched_pd_dataset.parquet")
     parser.add_argument("--num-samples", type=int)
     args = parser.parse_args()
 
@@ -189,6 +221,21 @@ def main() -> None:
     if args.rollout_n <= 0:
         parser.error("--rollout-n must be greater than zero")
     records, candidates = load_candidates(args.log, args.rollout_n)
+    dataset = load_dataset(args.input)
+    dataset_ids = dataset.apply(dataset_instance_id, axis=1).astype(str)
+    empty_dataset_ids = dataset_ids == ""
+    if empty_dataset_ids.any():
+        raise ValueError(
+            f"Cannot resolve instance_id for {int(empty_dataset_ids.sum())} rows in --input"
+        )
+    duplicate_dataset_ids = dataset_ids.value_counts()
+    duplicate_dataset_ids = duplicate_dataset_ids[duplicate_dataset_ids > 1]
+    if not duplicate_dataset_ids.empty:
+        raise ValueError(
+            "Candidate dataset has duplicate instance_id values: "
+            f"{duplicate_dataset_ids.index[:10].tolist()}"
+        )
+    candidates = candidates[candidates["instance_id"].isin(set(dataset_ids))].copy()
     if reference.empty:
         raise ValueError("Reference CSV contains no target rows")
     if candidates.empty:
@@ -226,11 +273,28 @@ def main() -> None:
     selected = selected.sort_values("reference_match_distance", kind="stable").reset_index(drop=True)
     selected.insert(0, "reference_match_rank", range(1, len(selected) + 1))
 
+    selection_rank = dict(
+        zip(selected["instance_id"], selected["reference_match_rank"], strict=True)
+    )
+    selected_dataset = dataset[dataset_ids.isin(selection_rank)].copy()
+    selected_dataset.insert(
+        0,
+        "reference_match_rank",
+        dataset_ids[dataset_ids.isin(selection_rank)].map(selection_rank).to_numpy(),
+    )
+    selected_dataset = selected_dataset.sort_values("reference_match_rank", kind="stable")
+    if len(selected_dataset) != len(selected):
+        raise ValueError(
+            f"Selected statistics contain {len(selected)} instances but only "
+            f"{len(selected_dataset)} rows were found in --input"
+        )
+
     comparison = distribution_rows(targets, selected, features)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.comparison).parent.mkdir(parents=True, exist_ok=True)
     selected.to_csv(args.output, index=False)
     comparison.to_csv(args.comparison, index=False)
+    save_dataset(selected_dataset, args.dataset_output)
 
     print(f"Reference rows: {len(reference)}")
     print(f"New ROLLOUT_SAMPLE records: {len(records)}")
@@ -240,6 +304,14 @@ def main() -> None:
     print(f"Mean reference-match distance: {selected['reference_match_distance'].mean():.6f}")
     print(f"Selected CSV: {args.output}")
     print(f"Distribution comparison CSV: {args.comparison}")
+    print(f"Selected dataset: {args.dataset_output}")
+    print("Selected pd_suitability_score values:")
+    for row in selected.itertuples(index=False):
+        print(
+            f"rank={row.reference_match_rank} "
+            f"instance_id={row.instance_id} "
+            f"pd_suitability_score={row.pd_suitability_score:.6f}"
+        )
     print(comparison.to_string(index=False))
 
 
