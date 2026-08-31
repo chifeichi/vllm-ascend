@@ -106,14 +106,14 @@ def main() -> None:
             (start.global_steps, start.sample_index), set()
         ).update(instance_ids)
 
-    rows = []
+    session_rows = []
     for session_id, start in starts.items():
         if session_id in completed:
             continue
         group_key = (start.global_steps, start.sample_index)
         instance_ids = sorted(group_instance_ids.get(group_key, set()))
         activity = last_activity.get(session_id)
-        rows.append(
+        session_rows.append(
             {
                 "instance_id": instance_ids[0] if len(instance_ids) == 1 else "",
                 "instance_id_status": (
@@ -135,7 +135,7 @@ def main() -> None:
             }
         )
 
-    rows.sort(
+    session_rows.sort(
         key=lambda row: (
             str(row["global_steps"]),
             int(row["sample_index"]),
@@ -143,8 +143,7 @@ def main() -> None:
         )
     )
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
+    session_fieldnames = [
         "instance_id",
         "instance_id_status",
         "global_steps",
@@ -157,39 +156,98 @@ def main() -> None:
         "last_line",
         "last_activity",
     ]
-    with open(args.output, "w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
     started_groups: dict[tuple[str, int], set[int]] = {}
     completed_groups: dict[tuple[str, int], set[int]] = {}
+    group_session_ids: dict[tuple[str, int], list[str]] = {}
     for session_id, start in starts.items():
         key = (start.global_steps, start.sample_index)
         started_groups.setdefault(key, set()).add(start.session_index)
+        group_session_ids.setdefault(key, []).append(session_id)
         if session_id in completed:
             completed_groups.setdefault(key, set()).add(start.session_index)
 
-    incomplete_groups = 0
     expected_indices = set(range(args.rollout_n))
-    for key in started_groups:
-        if completed_groups.get(key, set()) != expected_indices:
-            incomplete_groups += 1
+    group_rows = []
+    for key, started_indices in started_groups.items():
+        completed_indices = completed_groups.get(key, set())
+        incomplete_session_ids = [
+            session_id
+            for session_id in group_session_ids[key]
+            if session_id not in completed
+        ]
+        if completed_indices == expected_indices and not incomplete_session_ids:
+            continue
+        instance_ids = sorted(group_instance_ids.get(key, set()))
+        group_rows.append(
+            {
+                "instance_id": instance_ids[0] if len(instance_ids) == 1 else "",
+                "instance_id_status": (
+                    "mapped"
+                    if len(instance_ids) == 1
+                    else "unknown"
+                    if not instance_ids
+                    else "ambiguous"
+                ),
+                "global_steps": key[0],
+                "sample_index": key[1],
+                "started_session_indices": ",".join(map(str, sorted(started_indices))),
+                "completed_session_indices": ",".join(map(str, sorted(completed_indices))),
+                "missing_session_indices": ",".join(
+                    map(str, sorted(expected_indices - completed_indices))
+                ),
+                "started_session_count": len(group_session_ids[key]),
+                "completed_session_count": sum(
+                    session_id in completed for session_id in group_session_ids[key]
+                ),
+                "incomplete_session_ids": ",".join(incomplete_session_ids),
+            }
+        )
+
+    group_rows.sort(
+        key=lambda row: (str(row["global_steps"]), int(row["sample_index"]))
+    )
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    group_fieldnames = [
+        "instance_id",
+        "instance_id_status",
+        "global_steps",
+        "sample_index",
+        "started_session_indices",
+        "completed_session_indices",
+        "missing_session_indices",
+        "started_session_count",
+        "completed_session_count",
+        "incomplete_session_ids",
+    ]
+    with open(output_path, "w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=group_fieldnames)
+        writer.writeheader()
+        writer.writerows(group_rows)
+
+    session_output = output_path.with_name(
+        f"{output_path.stem}_sessions{output_path.suffix or '.csv'}"
+    )
+    with open(session_output, "w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=session_fieldnames)
+        writer.writeheader()
+        writer.writerows(session_rows)
 
     print(f"started_sessions={len(starts)}")
     print(f"completed_sessions={len(set(starts) & set(completed))}")
-    print(f"incomplete_sessions={len(rows)}")
-    print(f"incomplete_sample_groups={incomplete_groups}")
+    print(f"incomplete_sessions={len(session_rows)}")
+    print(f"incomplete_instances={len(group_rows)}")
     print(f"malformed_rollout_records={len(malformed)}")
     print(f"output={args.output}")
-    for row in rows:
+    print(f"session_output={session_output}")
+    for row in group_rows:
         print(
             f"instance_id={row['instance_id'] or 'UNKNOWN'} "
             f"global_steps={row['global_steps']} "
             f"sample_index={row['sample_index']} "
-            f"session_index={row['session_index']} "
-            f"session_id={row['session_id']} "
-            f"last={row['last_log']}:{row['last_line']}"
+            f"completed={row['completed_session_indices'] or '-'} "
+            f"missing={row['missing_session_indices'] or '-'}"
         )
 
 
