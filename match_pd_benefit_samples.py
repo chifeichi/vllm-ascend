@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from select_pd_benefit_samples import parse_logs, rank_samples, summarize
+
 
 FEATURES = {
     "decode_pressure_proxy_p25": 0.30,
@@ -35,12 +37,21 @@ def load_reference(path: str) -> pd.DataFrame:
     return frame
 
 
-def load_candidates(path: str) -> pd.DataFrame:
-    frame = pd.read_csv(path)
-    for column in ("rollout_n_eligible", "trajectory_eligible"):
-        if column in frame:
-            frame = frame[parse_bool(frame[column])].copy()
-    return frame
+def load_candidates(paths: list[str], rollout_n: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    records = parse_logs(paths)
+    summary = rank_samples(
+        summarize(records),
+        tail_quantile=1.0,
+        cache_quantile=1.0,
+        max_turns_quantile=1.0,
+        rollout_n=rollout_n,
+        min_model_prompt_ratio=None,
+        max_turns_mean=None,
+    )
+    candidates = summary[
+        summary["rollout_n_eligible"] & summary["trajectory_eligible"]
+    ].copy()
+    return records, candidates
 
 
 def validate_columns(reference: pd.DataFrame, candidates: pd.DataFrame) -> list[str]:
@@ -50,7 +61,7 @@ def validate_columns(reference: pd.DataFrame, candidates: pd.DataFrame) -> list[
     if missing_reference:
         raise ValueError(f"Reference CSV is missing columns: {missing_reference}")
     if missing_candidates:
-        raise ValueError(f"Candidate CSV is missing columns: {missing_candidates}")
+        raise ValueError(f"New log summary is missing columns: {missing_candidates}")
 
     usable = []
     for name in FEATURES:
@@ -162,18 +173,28 @@ def main() -> None:
         description="Select a new PD-benefit cohort matching an older report CSV"
     )
     parser.add_argument("--reference", required=True, help="Old well-performing report CSV")
-    parser.add_argument("--candidates", required=True, help="New candidate report CSV")
+    parser.add_argument(
+        "--log",
+        nargs="+",
+        required=True,
+        help="New-version logs containing ROLLOUT_SAMPLE records",
+    )
+    parser.add_argument("--rollout-n", type=int, default=4)
     parser.add_argument("--output", default="matched_pd_selection.csv")
     parser.add_argument("--comparison", default="matched_pd_distribution.csv")
     parser.add_argument("--num-samples", type=int)
     args = parser.parse_args()
 
     reference = load_reference(args.reference)
-    candidates = load_candidates(args.candidates)
+    if args.rollout_n <= 0:
+        parser.error("--rollout-n must be greater than zero")
+    records, candidates = load_candidates(args.log, args.rollout_n)
     if reference.empty:
         raise ValueError("Reference CSV contains no target rows")
     if candidates.empty:
-        raise ValueError("Candidate CSV contains no valid candidates")
+        raise ValueError(
+            "New logs contain no candidates with complete rollout.n groups and valid trajectories"
+        )
 
     features = validate_columns(reference, candidates)
     num_samples = len(reference) if args.num_samples is None else args.num_samples
@@ -212,6 +233,8 @@ def main() -> None:
     comparison.to_csv(args.comparison, index=False)
 
     print(f"Reference rows: {len(reference)}")
+    print(f"New ROLLOUT_SAMPLE records: {len(records)}")
+    print(f"New logged instances: {records['instance_id'].nunique()}")
     print(f"Valid candidate rows: {len(candidates)}")
     print(f"Selected rows: {len(selected)}")
     print(f"Mean reference-match distance: {selected['reference_match_distance'].mean():.6f}")
