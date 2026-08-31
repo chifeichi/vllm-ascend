@@ -120,6 +120,17 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     for instance_id, group in records.groupby("instance_id", sort=False):
         session_key = "session_id" if "session_id" in group else None
         session_groups = group.groupby(session_key, sort=False) if session_key else [(None, group)]
+        session_index_counts = None
+        if session_key and "session_index" in group:
+            session_metadata = group[["session_id", "session_index"]].drop_duplicates("session_id")
+            session_metadata["session_index"] = pd.to_numeric(
+                session_metadata["session_index"], errors="coerce"
+            )
+            session_metadata = session_metadata.dropna(subset=["session_index"])
+            session_index_counts = {
+                int(index): int(count)
+                for index, count in session_metadata["session_index"].value_counts().items()
+            }
         session_rows = []
         for _, session_group in session_groups:
             prompt_tokens = float(session_group["prompt_tokens"].sum())
@@ -177,6 +188,7 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
                 "instance_id": str(instance_id),
                 "sessions": sessions,
                 "trajectory_records": len(group),
+                "session_index_counts": session_index_counts,
                 "prompt_tokens_p25": float(sessions_frame["prompt_tokens"].quantile(0.25)),
                 "prompt_tokens_p50": float(sessions_frame["prompt_tokens"].median()),
                 "prompt_tokens_mean": prompt_mean,
@@ -308,11 +320,19 @@ def rank_samples(
         & (result["final_context_tokens_p75"] <= context_cutoff)
     )
 
-    result["rollout_n_eligible"] = (
-        (result["sessions"] >= rollout_n)
-        & (result["sessions"] % rollout_n == 0)
-        & (result["trajectory_records"] == result["sessions"])
-    )
+    def has_complete_rollout_groups(row: pd.Series) -> bool:
+        counts = row.get("session_index_counts")
+        if isinstance(counts, dict) and counts:
+            expected_indices = set(range(rollout_n))
+            return (
+                set(counts) == expected_indices
+                and len(set(counts.values())) == 1
+                and next(iter(counts.values())) > 0
+            )
+        sessions = int(row["sessions"])
+        return sessions >= rollout_n and sessions % rollout_n == 0
+
+    result["rollout_n_eligible"] = result.apply(has_complete_rollout_groups, axis=1)
     result["ratio_eligible"] = (
         True
         if min_model_prompt_ratio is None
@@ -689,7 +709,7 @@ def main() -> None:
     )
     print(
         f"rollout.n-eligible instances: {int(summary['rollout_n_eligible'].sum())} "
-        f"(complete groups of n={args.rollout_n}, one trajectory per session)"
+        f"(complete session_index groups of n={args.rollout_n})"
     )
     print(
         f"Cache-eligible instances: {int(summary['cache_eligible'].sum())} "
