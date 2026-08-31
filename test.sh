@@ -1,1 +1,17 @@
-python -c 'import mooncake.engine; print("".join(x for x in open("/proc/self/maps") if any(k in x for k in ("mooncake/", "transfer_engine", "ascend_transport"))))'
+python - <<'PY'
+import pandas as pd
+
+x = pd.read_csv("swe_rebench_pd_selection.csv")
+
+for c in [
+    "rollout_n_eligible",
+    "trajectory_eligible",
+    "tail_eligible",
+    "cache_eligible",
+    "turns_eligible",
+    "ratio_eligible",
+    "selection_eligible",
+]:
+    ok = x[c].astype(str).str.lower().eq("true")
+    print(c, ok.sum())
+PY
