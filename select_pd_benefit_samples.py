@@ -439,6 +439,10 @@ def select_similar_cohort(
     num_samples: int,
     pool_size: int,
     closeness_weight: float,
+    reference_weight: float,
+    reference_levels: dict[str, float] | None,
+    max_cohort_cv: float,
+    max_cohort_max_min: float,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     workload_features = {
         "p_work_proxy_mean": 0.30,
@@ -447,8 +451,22 @@ def select_similar_cohort(
         "total_work_proxy_mean": 0.25,
     }
     candidates = summary[summary["cohort_eligible"]].copy()
+    if reference_levels is not None:
+        candidates["_reference_distance"] = sum(
+            workload_features[name]
+            * (candidates[name].clip(lower=1e-12) / reference_levels[name])
+            .map(math.log)
+            .abs()
+            for name in workload_features
+        )
+        candidates["_pool_priority"] = (
+            candidates["pd_suitability_score"]
+            - reference_weight * candidates["_reference_distance"]
+        )
+    else:
+        candidates["_pool_priority"] = candidates["pd_suitability_score"]
     candidates = candidates.sort_values(
-        ["pd_suitability_score", "decode_pressure_proxy_p25"],
+        ["_pool_priority", "decode_pressure_proxy_p25"],
         ascending=[False, False],
     )
     candidates = candidates.head(pool_size)
@@ -471,9 +489,20 @@ def select_similar_cohort(
     best_stats: dict[str, float] = {}
     for indices in combinations(candidates.index.tolist(), num_samples):
         cohort = candidates.loc[list(indices)]
-        spreads = {
-            name: float(cohort[name].max() / max(cohort[name].min(), 1e-12) - 1.0)
+        cvs = {
+            name: float(cohort[name].std(ddof=0) / max(cohort[name].mean(), 1e-12))
             for name in workload_features
+        }
+        max_min_ratios = {
+            name: float(cohort[name].max() / max(cohort[name].min(), 1e-12))
+            for name in workload_features
+        }
+        if any(value > max_cohort_cv for value in cvs.values()) or any(
+            value > max_cohort_max_min for value in max_min_ratios.values()
+        ):
+            continue
+        spreads = {
+            name: max_min_ratios[name] - 1.0 for name in workload_features
         }
         closeness_penalty = sum(
             workload_features[name] * spreads[name]
@@ -482,7 +511,27 @@ def select_similar_cohort(
         mean_score = float(cohort["pd_suitability_score"].mean())
         min_score = float(cohort["pd_suitability_score"].min())
         score_quality = 0.70 * mean_score + 0.30 * min_score
-        objective = score_quality - closeness_weight * closeness_penalty
+        cohort_levels = {
+            "p_work_proxy_mean": float(cohort["p_work_proxy_mean"].mean()),
+            "model_tokens_mean": float(cohort["model_tokens_mean"].mean()),
+            "decode_pressure_proxy": float(
+                cohort["model_tokens_mean"].sum()
+                / max(float(cohort["p_work_proxy_mean"].sum()), 1e-12)
+            ),
+            "total_work_proxy_mean": float(cohort["total_work_proxy_mean"].mean()),
+        }
+        reference_penalty = 0.0
+        if reference_levels is not None:
+            reference_penalty = sum(
+                workload_features[name]
+                * abs(math.log(cohort_levels[name] / reference_levels[name]))
+                for name in workload_features
+            )
+        objective = (
+            score_quality
+            - closeness_weight * closeness_penalty
+            - reference_weight * reference_penalty
+        )
         key = (
             objective,
             -closeness_penalty,
@@ -498,14 +547,19 @@ def select_similar_cohort(
                 "mean_score": mean_score,
                 "min_score": min_score,
                 "closeness_penalty": closeness_penalty,
+                "reference_penalty": reference_penalty,
                 **{f"spread_{name}": value for name, value in spreads.items()},
-                **{
-                    f"mean_{name}": float(cohort[name].mean())
-                    for name in workload_features
-                },
+                **{f"cv_{name}": value for name, value in cvs.items()},
+                **{f"mean_{name}": value for name, value in cohort_levels.items()},
             }
 
-    assert best_indices is not None
+    if best_indices is None:
+        raise ValueError(
+            "No cohort satisfies the batch-balance constraints: "
+            f"CV<={max_cohort_cv:g} and max/min<={max_cohort_max_min:g} "
+            "for P, D, D/P, and total. Increase --cohort-pool-size if possible, "
+            "expand the input pool, or explicitly relax the two limits."
+        )
     selected = candidates.loc[list(best_indices)].sort_values(
         ["pd_suitability_score", "decode_pressure_proxy_p25"],
         ascending=[False, False],
@@ -572,6 +626,30 @@ def main() -> None:
         type=_validate_positive,
         default=0.10,
         help="Penalty weight for workload spread inside the selected batch (default: 0.10).",
+    )
+    parser.add_argument(
+        "--cohort-reference-weight",
+        type=_validate_positive,
+        default=0.35,
+        help=(
+            "Soft penalty for moving away from the aggregate workload of "
+            "--score-input (default: 0.35; inactive without --score-input)."
+        ),
+    )
+    parser.add_argument(
+        "--max-cohort-cv",
+        type=_validate_positive,
+        default=0.30,
+        help="Maximum batch-level CV for each of P, D, D/P, and total (default: 0.30).",
+    )
+    parser.add_argument(
+        "--max-cohort-max-min",
+        type=_validate_at_least_one,
+        default=2.50,
+        help=(
+            "Maximum batch-level max/min ratio for each of P, D, D/P, and total "
+            "(default: 2.50)."
+        ),
     )
     parser.add_argument("--max-work-cv", type=_validate_positive, default=0.35)
     parser.add_argument(
@@ -700,12 +778,38 @@ def main() -> None:
     cohort_stats: dict[str, float] | None = None
     selection_error: ValueError | None = None
     if args.similar_cohort:
+        reference_levels: dict[str, float] | None = None
+        if args.score_input:
+            if missing_scored_ids:
+                raise ValueError(
+                    "Cannot use --score-input as a cohort reference because "
+                    f"{len(missing_scored_ids)} reference instances are absent "
+                    "from the current input/logs."
+                )
+            reference = summary[summary["in_score_input"]]
+            if reference.empty:
+                raise ValueError("--score-input contains no instances to use as a reference")
+            reference_levels = {
+                "p_work_proxy_mean": float(reference["p_work_proxy_mean"].mean()),
+                "model_tokens_mean": float(reference["model_tokens_mean"].mean()),
+                "decode_pressure_proxy": float(
+                    reference["model_tokens_mean"].sum()
+                    / max(float(reference["p_work_proxy_mean"].sum()), 1e-12)
+                ),
+                "total_work_proxy_mean": float(
+                    reference["total_work_proxy_mean"].mean()
+                ),
+            }
         try:
             selected_summary, cohort_stats = select_similar_cohort(
                 summary,
                 args.num_samples,
                 args.cohort_pool_size,
                 args.cohort_closeness_weight,
+                args.cohort_reference_weight,
+                reference_levels,
+                args.max_cohort_cv,
+                args.max_cohort_max_min,
             )
         except ValueError as exc:
             selected_summary = summary.iloc[0:0].copy()
@@ -841,8 +945,17 @@ def main() -> None:
             f"(score_quality={cohort_stats['score_quality']:.6f}, "
             f"mean_score={cohort_stats['mean_score']:.6f}, "
             f"min_score={cohort_stats['min_score']:.6f}, "
+            f"reference_penalty={cohort_stats['reference_penalty']:.6f}, "
             f"balance_penalty={cohort_stats['closeness_penalty']:.6f})"
         )
+        if reference_levels is not None:
+            print(
+                "Similar-cohort dynamic reference: "
+                f"P={reference_levels['p_work_proxy_mean']:.0f}, "
+                f"D={reference_levels['model_tokens_mean']:.0f}, "
+                f"D/P={reference_levels['decode_pressure_proxy']:.3f}, "
+                f"total={reference_levels['total_work_proxy_mean']:.0f}"
+            )
         print(
             "Similar-cohort workload means: "
             f"P={cohort_stats['mean_p_work_proxy_mean']:.0f}, "
@@ -856,6 +969,15 @@ def main() -> None:
             f"D={cohort_stats['spread_model_tokens_mean']:.3f}, "
             f"D/P={cohort_stats['spread_decode_pressure_proxy']:.3f}, "
             f"total={cohort_stats['spread_total_work_proxy_mean']:.3f}"
+        )
+        print(
+            "Similar-cohort CV: "
+            f"P={cohort_stats['cv_p_work_proxy_mean']:.3f}, "
+            f"D={cohort_stats['cv_model_tokens_mean']:.3f}, "
+            f"D/P={cohort_stats['cv_decode_pressure_proxy']:.3f}, "
+            f"total={cohort_stats['cv_total_work_proxy_mean']:.3f} "
+            f"(hard limits: CV<={args.max_cohort_cv:g}, "
+            f"max/min<={args.max_cohort_max_min:g})"
         )
     if args.score_input:
         scored_summary = summary[summary["in_score_input"]].sort_values(
