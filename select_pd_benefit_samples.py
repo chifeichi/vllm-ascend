@@ -443,6 +443,7 @@ def select_similar_cohort(
     reference_levels: dict[str, float] | None,
     max_cohort_cv: float,
     max_cohort_max_min: float,
+    max_reference_ratio: float,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     workload_features = {
         "p_work_proxy_mean": 0.30,
@@ -522,6 +523,15 @@ def select_similar_cohort(
         }
         reference_penalty = 0.0
         if reference_levels is not None:
+            reference_ratios = {
+                name: max(
+                    cohort_levels[name] / reference_levels[name],
+                    reference_levels[name] / cohort_levels[name],
+                )
+                for name in workload_features
+            }
+            if any(value > max_reference_ratio for value in reference_ratios.values()):
+                continue
             reference_penalty = sum(
                 workload_features[name]
                 * abs(math.log(cohort_levels[name] / reference_levels[name]))
@@ -557,8 +567,14 @@ def select_similar_cohort(
         raise ValueError(
             "No cohort satisfies the batch-balance constraints: "
             f"CV<={max_cohort_cv:g} and max/min<={max_cohort_max_min:g} "
-            "for P, D, D/P, and total. Increase --cohort-pool-size if possible, "
-            "expand the input pool, or explicitly relax the two limits."
+            "for P, D, D/P, and total"
+            + (
+                f", with aggregate/reference ratio<={max_reference_ratio:g}."
+                if reference_levels is not None
+                else "."
+            )
+            + " Increase --cohort-pool-size if possible, expand the input pool, "
+            "or explicitly relax the limits."
         )
     selected = candidates.loc[list(best_indices)].sort_values(
         ["pd_suitability_score", "decode_pressure_proxy_p25"],
@@ -649,6 +665,15 @@ def main() -> None:
         help=(
             "Maximum batch-level max/min ratio for each of P, D, D/P, and total "
             "(default: 2.50)."
+        ),
+    )
+    parser.add_argument(
+        "--max-cohort-reference-ratio",
+        type=_validate_at_least_one,
+        default=1.25,
+        help=(
+            "Maximum symmetric ratio between the selected batch aggregate and "
+            "--score-input for P, D, D/P, and total (default: 1.25)."
         ),
     )
     parser.add_argument("--max-work-cv", type=_validate_positive, default=0.35)
@@ -810,6 +835,7 @@ def main() -> None:
                 reference_levels,
                 args.max_cohort_cv,
                 args.max_cohort_max_min,
+                args.max_cohort_reference_ratio,
             )
         except ValueError as exc:
             selected_summary = summary.iloc[0:0].copy()
@@ -954,7 +980,8 @@ def main() -> None:
                 f"P={reference_levels['p_work_proxy_mean']:.0f}, "
                 f"D={reference_levels['model_tokens_mean']:.0f}, "
                 f"D/P={reference_levels['decode_pressure_proxy']:.3f}, "
-                f"total={reference_levels['total_work_proxy_mean']:.0f}"
+                f"total={reference_levels['total_work_proxy_mean']:.0f} "
+                f"(selected/reference ratio<={args.max_cohort_reference_ratio:g})"
             )
         print(
             "Similar-cohort workload means: "
