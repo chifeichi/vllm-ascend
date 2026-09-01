@@ -271,6 +271,7 @@ def rank_samples(
     tail_quantile: float,
     cache_quantile: float,
     min_decode_pressure_quantile: float,
+    min_decode_work_quantile: float,
     max_turns_quantile: float,
     rollout_n: int,
     min_model_prompt_ratio: float | None,
@@ -337,6 +338,12 @@ def rank_samples(
         result["decode_pressure_proxy_p25"] >= decode_pressure_cutoff
     )
 
+    decode_work_cutoff = float(
+        result["model_tokens_p25"].quantile(min_decode_work_quantile)
+    )
+    result["decode_work_cutoff"] = decode_work_cutoff
+    result["decode_work_eligible"] = result["model_tokens_p25"] >= decode_work_cutoff
+
     def has_complete_rollout_groups(row: pd.Series) -> bool:
         counts = row.get("session_index_counts")
         if isinstance(counts, dict) and counts:
@@ -370,6 +377,7 @@ def rank_samples(
         result["tail_eligible"]
         & result["cache_eligible"]
         & result["decode_pressure_eligible"]
+        & result["decode_work_eligible"]
         & result["rollout_n_eligible"]
         & result["ratio_eligible"]
         & result["turns_eligible"]
@@ -562,8 +570,8 @@ def main() -> None:
     parser.add_argument(
         "--cohort-closeness-weight",
         type=_validate_positive,
-        default=0.40,
-        help="Penalty weight for workload spread inside the selected batch (default: 0.40).",
+        default=0.10,
+        help="Penalty weight for workload spread inside the selected batch (default: 0.10).",
     )
     parser.add_argument("--max-work-cv", type=_validate_positive, default=0.35)
     parser.add_argument(
@@ -597,9 +605,18 @@ def main() -> None:
     parser.add_argument(
         "--min-decode-pressure-quantile",
         type=_validate_tail_quantile,
-        default=0.50,
+        default=0.75,
         help=(
             "Keep instances whose stable D/P proxy is at or above this population "
+            "quantile (default: 0.75)."
+        ),
+    )
+    parser.add_argument(
+        "--min-decode-work-quantile",
+        type=_validate_tail_quantile,
+        default=0.50,
+        help=(
+            "Keep instances whose stable D work is at or above this population "
             "quantile (default: 0.50)."
         ),
     )
@@ -653,6 +670,7 @@ def main() -> None:
             args.tail_quantile,
             args.cache_quantile,
             args.min_decode_pressure_quantile,
+            args.min_decode_work_quantile,
             args.max_turns_quantile,
             args.rollout_n,
             args.min_model_prompt_ratio,
@@ -759,6 +777,11 @@ def main() -> None:
         f"(D/P P25 >= population P{args.min_decode_pressure_quantile * 100:g} "
         f"cutoff={summary['decode_pressure_cutoff'].iloc[0]:.3f})"
     )
+    print(
+        f"Decode-work-eligible instances: {int(summary['decode_work_eligible'].sum())} "
+        f"(D P25 >= population P{args.min_decode_work_quantile * 100:g} "
+        f"cutoff={summary['decode_work_cutoff'].iloc[0]:.0f})"
+    )
     if args.min_model_prompt_ratio is None:
         print("Model/prompt hard threshold: disabled")
     else:
@@ -864,6 +887,7 @@ def main() -> None:
                         "tail_eligible",
                         "cache_eligible",
                         "decode_pressure_eligible",
+                        "decode_work_eligible",
                         "turns_eligible",
                         "ratio_eligible",
                     )
@@ -942,5 +966,6 @@ if __name__ == "__main__":
 #   --rollout-n 4 \
 #   --tail-quantile 0.85 \
 #   --cache-quantile 0.70 \
-#   --min-decode-pressure-quantile 0.50 \
+#   --min-decode-pressure-quantile 0.75 \
+#   --min-decode-work-quantile 0.50 \
 #   --similar-cohort
