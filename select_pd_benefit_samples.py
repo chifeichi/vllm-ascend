@@ -589,7 +589,6 @@ def repair_reference_cohort(
     pool_size: int,
     max_cohort_cv: float,
     max_cohort_max_min: float,
-    max_replacement_distance_ratio: float,
     reference_levels: dict[str, float],
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     features = {
@@ -616,9 +615,12 @@ def repair_reference_cohort(
         for name, weight in features.items()
     )
     shortest_first = reference.sort_values("_shortness", ascending=False).index.tolist()
-    replacements = summary[
-        summary["cohort_eligible"] & ~summary["in_score_input"]
-    ].copy()
+    replacement_eligible = (
+        summary["rollout_n_eligible"]
+        & summary["trajectory_eligible"]
+        & summary["stability_eligible"]
+    )
+    replacements = summary[replacement_eligible & ~summary["in_score_input"]].copy()
 
     max_replacements = min(6, num_samples - 1)
     for replacement_count in range(1, max_replacements + 1):
@@ -635,11 +637,7 @@ def repair_reference_cohort(
             .abs()
             for name, weight in features.items()
         )
-        similar_mask = pd.Series(True, index=candidates.index)
-        for name in features:
-            ratio = candidates[name].clip(lower=1e-12) / core_medians[name]
-            similar_mask &= ratio.combine(1.0 / ratio, max) <= max_replacement_distance_ratio
-        candidates = candidates[similar_mask].nsmallest(pool_size, "_repair_distance")
+        candidates = candidates.nsmallest(pool_size, "_repair_distance")
         if len(candidates) < replacement_count:
             continue
 
@@ -964,7 +962,6 @@ def main() -> None:
                     args.cohort_pool_size,
                     args.max_cohort_cv,
                     args.max_cohort_max_min,
-                    args.max_cohort_reference_ratio,
                     reference_levels,
                 )
             else:
@@ -1124,7 +1121,7 @@ def main() -> None:
                 f"D/P={reference_levels['decode_pressure_proxy']:.3f}, "
                 f"total={reference_levels['total_work_proxy_mean']:.0f} "
                 f"(replaced_short={int(cohort_stats['replacements'])}, "
-                f"replacement/core ratio<={args.max_cohort_reference_ratio:g})"
+                f"nearest_candidate_pool={args.cohort_pool_size})"
             )
         print(
             "Similar-cohort workload means: "
