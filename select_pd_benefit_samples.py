@@ -270,6 +270,7 @@ def rank_samples(
     summary: pd.DataFrame,
     tail_quantile: float,
     cache_quantile: float,
+    min_decode_pressure_quantile: float,
     max_turns_quantile: float,
     rollout_n: int,
     min_model_prompt_ratio: float | None,
@@ -285,6 +286,12 @@ def rank_samples(
     result["stable_model_tokens_percentile"] = result["model_tokens_p25"].rank(
         method="average", pct=True, ascending=True
     )
+    result["low_p_work_percentile"] = 1.0 - result["p_work_proxy_p75"].rank(
+        method="average", pct=True, ascending=True
+    )
+    result["low_total_work_percentile"] = 1.0 - result["total_work_proxy_p50"].rank(
+        method="average", pct=True, ascending=True
+    )
     result["low_final_context_percentile"] = 1.0 - result["final_context_tokens_p75"].rank(
         method="average", pct=True, ascending=True
     )
@@ -293,14 +300,16 @@ def rank_samples(
     )
 
     # ROLLOUT_SAMPLE has token totals but no session/model/tool wall times.  This
-    # score balances stable D-side work against estimated P-side recomputation
-    # and prefix-cache footprint.  Cache/tail eligibility below remains a hard
-    # guardrail; the score also continuously prefers smaller final contexts.
+    # Prefer D work that is efficient relative to P/cache cost, rather than
+    # maximizing absolute D work. Cache/tail eligibility below remains a hard
+    # guardrail, while P and total work are also continuous score penalties.
     result["pd_suitability_score"] = (
-        0.40 * result["stable_decode_p_work_percentile"]
-        + 0.25 * result["stable_model_per_turn_percentile"]
-        + 0.15 * result["stable_model_tokens_percentile"]
-        + 0.10 * result["low_final_context_percentile"]
+        0.35 * result["stable_decode_p_work_percentile"]
+        + 0.10 * result["stable_model_per_turn_percentile"]
+        + 0.10 * result["stable_model_tokens_percentile"]
+        + 0.20 * result["low_p_work_percentile"]
+        + 0.10 * result["low_total_work_percentile"]
+        + 0.05 * result["low_final_context_percentile"]
         + 0.10 * result["stable_rollouts_percentile"]
     )
     result["pd_score_rank_all"] = result["pd_suitability_score"].rank(
@@ -318,6 +327,14 @@ def rank_samples(
     result["cache_eligible"] = (
         (result["p_work_proxy_p75"] <= p_work_cutoff)
         & (result["final_context_tokens_p75"] <= context_cutoff)
+    )
+
+    decode_pressure_cutoff = float(
+        result["decode_pressure_proxy_p25"].quantile(min_decode_pressure_quantile)
+    )
+    result["decode_pressure_cutoff"] = decode_pressure_cutoff
+    result["decode_pressure_eligible"] = (
+        result["decode_pressure_proxy_p25"] >= decode_pressure_cutoff
     )
 
     def has_complete_rollout_groups(row: pd.Series) -> bool:
@@ -352,6 +369,7 @@ def rank_samples(
     result["selection_eligible"] = (
         result["tail_eligible"]
         & result["cache_eligible"]
+        & result["decode_pressure_eligible"]
         & result["rollout_n_eligible"]
         & result["ratio_eligible"]
         & result["turns_eligible"]
@@ -414,7 +432,14 @@ def select_similar_cohort(
     pool_size: int,
     closeness_weight: float,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    candidates = summary[summary["cohort_eligible"]].sort_values(
+    workload_features = {
+        "p_work_proxy_mean": 0.30,
+        "model_tokens_mean": 0.25,
+        "decode_pressure_proxy": 0.20,
+        "total_work_proxy_mean": 0.25,
+    }
+    candidates = summary[summary["cohort_eligible"]].copy()
+    candidates = candidates.sort_values(
         ["pd_suitability_score", "decode_pressure_proxy_p25"],
         ascending=[False, False],
     )
@@ -433,32 +458,29 @@ def select_similar_cohort(
             "reduce --cohort-pool-size or --num-samples."
         )
 
-    # These describe both total service demand and the P/cache shape. Relative
-    # max/min spread makes the resulting four tasks directly comparable.
-    closeness_features = {
-        "total_work_proxy_p50": 0.40,
-        "p_work_proxy_p75": 0.25,
-        "final_context_tokens_p75": 0.20,
-        "num_turns_p50": 0.15,
-    }
     best_indices: tuple[int, ...] | None = None
     best_key: tuple[float, float, float, float] | None = None
     best_stats: dict[str, float] = {}
     for indices in combinations(candidates.index.tolist(), num_samples):
         cohort = candidates.loc[list(indices)]
         spreads = {
-            name: float(cohort[name].max() / max(cohort[name].min(), 1.0) - 1.0)
-            for name in closeness_features
+            name: float(cohort[name].max() / max(cohort[name].min(), 1e-12) - 1.0)
+            for name in workload_features
         }
         closeness_penalty = sum(
-            closeness_features[name] * spreads[name]
-            for name in closeness_features
+            workload_features[name] * spreads[name]
+            for name in workload_features
         )
         mean_score = float(cohort["pd_suitability_score"].mean())
         min_score = float(cohort["pd_suitability_score"].min())
         score_quality = 0.70 * mean_score + 0.30 * min_score
         objective = score_quality - closeness_weight * closeness_penalty
-        key = (objective, mean_score, min_score, -closeness_penalty)
+        key = (
+            objective,
+            -closeness_penalty,
+            mean_score,
+            min_score,
+        )
         if best_key is None or key > best_key:
             best_key = key
             best_indices = indices
@@ -469,6 +491,10 @@ def select_similar_cohort(
                 "min_score": min_score,
                 "closeness_penalty": closeness_penalty,
                 **{f"spread_{name}": value for name, value in spreads.items()},
+                **{
+                    f"mean_{name}": float(cohort[name].mean())
+                    for name in workload_features
+                },
             }
 
     assert best_indices is not None
@@ -523,8 +549,8 @@ def main() -> None:
         "--similar-cohort",
         action="store_true",
         help=(
-            "Jointly select a small, stable group from the highest-scoring "
-            "candidates so their total/P work, context, and turns are similar."
+            "Jointly select a stable group whose P, D, D/P, and total workloads "
+            "are mutually balanced."
         ),
     )
     parser.add_argument(
@@ -536,8 +562,8 @@ def main() -> None:
     parser.add_argument(
         "--cohort-closeness-weight",
         type=_validate_positive,
-        default=0.20,
-        help="Penalty weight for relative workload spread inside the cohort (default: 0.20).",
+        default=0.40,
+        help="Penalty weight for workload spread inside the selected batch (default: 0.40).",
     )
     parser.add_argument("--max-work-cv", type=_validate_positive, default=0.35)
     parser.add_argument(
@@ -558,14 +584,23 @@ def main() -> None:
             "more complete groups and one trajectory per session (default: 4)."
         ),
     )
-    parser.add_argument("--tail-quantile", type=_validate_tail_quantile, default=0.90)
+    parser.add_argument("--tail-quantile", type=_validate_tail_quantile, default=0.85)
     parser.add_argument(
         "--cache-quantile",
         type=_validate_tail_quantile,
-        default=0.80,
+        default=0.70,
         help=(
             "Keep instances whose P75 P-work and final-context proxies are no "
-            "larger than this population quantile (default: 0.80)."
+            "larger than this population quantile (default: 0.70)."
+        ),
+    )
+    parser.add_argument(
+        "--min-decode-pressure-quantile",
+        type=_validate_tail_quantile,
+        default=0.50,
+        help=(
+            "Keep instances whose stable D/P proxy is at or above this population "
+            "quantile (default: 0.50)."
         ),
     )
     parser.add_argument(
@@ -617,6 +652,7 @@ def main() -> None:
             summarize(records),
             args.tail_quantile,
             args.cache_quantile,
+            args.min_decode_pressure_quantile,
             args.max_turns_quantile,
             args.rollout_n,
             args.min_model_prompt_ratio,
@@ -717,6 +753,12 @@ def main() -> None:
         f"P-work P75<={summary['p_work_cache_cutoff'].iloc[0]:.0f}, "
         f"final-context P75<={summary['context_cache_cutoff'].iloc[0]:.0f})"
     )
+    print(
+        "Decode-pressure-eligible instances: "
+        f"{int(summary['decode_pressure_eligible'].sum())} "
+        f"(D/P P25 >= population P{args.min_decode_pressure_quantile * 100:g} "
+        f"cutoff={summary['decode_pressure_cutoff'].iloc[0]:.3f})"
+    )
     if args.min_model_prompt_ratio is None:
         print("Model/prompt hard threshold: disabled")
     else:
@@ -776,14 +818,21 @@ def main() -> None:
             f"(score_quality={cohort_stats['score_quality']:.6f}, "
             f"mean_score={cohort_stats['mean_score']:.6f}, "
             f"min_score={cohort_stats['min_score']:.6f}, "
-            f"closeness_penalty={cohort_stats['closeness_penalty']:.6f})"
+            f"balance_penalty={cohort_stats['closeness_penalty']:.6f})"
+        )
+        print(
+            "Similar-cohort workload means: "
+            f"P={cohort_stats['mean_p_work_proxy_mean']:.0f}, "
+            f"D={cohort_stats['mean_model_tokens_mean']:.0f}, "
+            f"D/P={cohort_stats['mean_decode_pressure_proxy']:.3f}, "
+            f"total={cohort_stats['mean_total_work_proxy_mean']:.0f}"
         )
         print(
             "Similar-cohort relative spreads: "
-            f"total_work_p50={cohort_stats['spread_total_work_proxy_p50']:.3f}, "
-            f"p_work_p75={cohort_stats['spread_p_work_proxy_p75']:.3f}, "
-            f"context_p75={cohort_stats['spread_final_context_tokens_p75']:.3f}, "
-            f"turns_p50={cohort_stats['spread_num_turns_p50']:.3f}"
+            f"P={cohort_stats['spread_p_work_proxy_mean']:.3f}, "
+            f"D={cohort_stats['spread_model_tokens_mean']:.3f}, "
+            f"D/P={cohort_stats['spread_decode_pressure_proxy']:.3f}, "
+            f"total={cohort_stats['spread_total_work_proxy_mean']:.3f}"
         )
     if args.score_input:
         scored_summary = summary[summary["in_score_input"]].sort_values(
@@ -814,6 +863,7 @@ def main() -> None:
                         "trajectory_eligible",
                         "tail_eligible",
                         "cache_eligible",
+                        "decode_pressure_eligible",
                         "turns_eligible",
                         "ratio_eligible",
                     )
@@ -865,6 +915,8 @@ def main() -> None:
             f"ratio:{row.stable_decode_p_work_percentile:.3f},"
             f"per_turn:{row.stable_model_per_turn_percentile:.3f},"
             f"model:{row.stable_model_tokens_percentile:.3f},"
+            f"low_p:{row.low_p_work_percentile:.3f},"
+            f"low_total:{row.low_total_work_percentile:.3f},"
             f"low_context:{row.low_final_context_percentile:.3f},"
             f"stability:{row.stable_rollouts_percentile:.3f} "
             f"response_prompt_ratio_mean={row.response_prompt_ratio_of_means:.3f} "
@@ -888,4 +940,7 @@ if __name__ == "__main__":
 #   --report swe_rebench_pd_selection.csv \
 #   --num-samples 32 \
 #   --rollout-n 4 \
-#   --tail-quantile 0.90
+#   --tail-quantile 0.85 \
+#   --cache-quantile 0.70 \
+#   --min-decode-pressure-quantile 0.50 \
+#   --similar-cohort
