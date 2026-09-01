@@ -479,7 +479,7 @@ def select_similar_cohort(
         )
 
     combination_count = math.comb(len(candidates), num_samples)
-    if combination_count > 1_000_000:
+    if combination_count > 3_000_000:
         raise ValueError(
             f"Similar-cohort search would evaluate {combination_count} combinations; "
             "reduce --cohort-pool-size or --num-samples."
@@ -583,6 +583,137 @@ def select_similar_cohort(
     return selected.copy(), best_stats
 
 
+def repair_reference_cohort(
+    summary: pd.DataFrame,
+    num_samples: int,
+    pool_size: int,
+    max_cohort_cv: float,
+    max_cohort_max_min: float,
+    max_replacement_distance_ratio: float,
+    reference_levels: dict[str, float],
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    features = {
+        "p_work_proxy_mean": 0.30,
+        "model_tokens_mean": 0.25,
+        "decode_pressure_proxy": 0.20,
+        "total_work_proxy_mean": 0.25,
+    }
+    reference = summary[summary["in_score_input"]].copy()
+    if len(reference) != num_samples:
+        raise ValueError(
+            f"--score-input contains {len(reference)} matched instances, but "
+            f"--num-samples={num_samples}; repair mode requires one complete old batch."
+        )
+
+    reference_medians = {
+        name: max(float(reference[name].median()), 1e-12) for name in features
+    }
+    reference["_shortness"] = sum(
+        weight
+        * (reference_medians[name] / reference[name].clip(lower=1e-12))
+        .map(math.log)
+        .clip(lower=0.0)
+        for name, weight in features.items()
+    )
+    shortest_first = reference.sort_values("_shortness", ascending=False).index.tolist()
+    replacements = summary[
+        summary["cohort_eligible"] & ~summary["in_score_input"]
+    ].copy()
+
+    max_replacements = min(6, num_samples - 1)
+    for replacement_count in range(1, max_replacements + 1):
+        removed_indices = shortest_first[:replacement_count]
+        core = reference.drop(index=removed_indices)
+        core_medians = {
+            name: max(float(core[name].median()), 1e-12) for name in features
+        }
+        candidates = replacements.copy()
+        candidates["_repair_distance"] = sum(
+            weight
+            * (candidates[name].clip(lower=1e-12) / core_medians[name])
+            .map(math.log)
+            .abs()
+            for name, weight in features.items()
+        )
+        similar_mask = pd.Series(True, index=candidates.index)
+        for name in features:
+            ratio = candidates[name].clip(lower=1e-12) / core_medians[name]
+            similar_mask &= ratio.combine(1.0 / ratio, max) <= max_replacement_distance_ratio
+        candidates = candidates[similar_mask].nsmallest(pool_size, "_repair_distance")
+        if len(candidates) < replacement_count:
+            continue
+
+        best_cohort: pd.DataFrame | None = None
+        best_key: tuple[float, float, float] | None = None
+        best_stats: dict[str, float] = {}
+        for indices in combinations(candidates.index.tolist(), replacement_count):
+            cohort = pd.concat([core, candidates.loc[list(indices)]])
+            cvs = {
+                name: float(cohort[name].std(ddof=0) / max(cohort[name].mean(), 1e-12))
+                for name in features
+            }
+            max_min_ratios = {
+                name: float(cohort[name].max() / max(cohort[name].min(), 1e-12))
+                for name in features
+            }
+            if any(value > max_cohort_cv for value in cvs.values()) or any(
+                value > max_cohort_max_min for value in max_min_ratios.values()
+            ):
+                continue
+
+            cohort_levels = {
+                "p_work_proxy_mean": float(cohort["p_work_proxy_mean"].mean()),
+                "model_tokens_mean": float(cohort["model_tokens_mean"].mean()),
+                "decode_pressure_proxy": float(
+                    cohort["model_tokens_mean"].sum()
+                    / max(float(cohort["p_work_proxy_mean"].sum()), 1e-12)
+                ),
+                "total_work_proxy_mean": float(cohort["total_work_proxy_mean"].mean()),
+            }
+            balance_penalty = sum(
+                features[name] * (max_min_ratios[name] - 1.0) for name in features
+            )
+            replacement_distance = float(
+                candidates.loc[list(indices), "_repair_distance"].mean()
+            )
+            reference_penalty = sum(
+                features[name]
+                * abs(math.log(cohort_levels[name] / reference_levels[name]))
+                for name in features
+            )
+            mean_score = float(cohort["pd_suitability_score"].mean())
+            key = (-replacement_distance, -balance_penalty, mean_score)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_cohort = cohort
+                best_stats = {
+                    "objective": -replacement_distance,
+                    "score_quality": mean_score,
+                    "mean_score": mean_score,
+                    "min_score": float(cohort["pd_suitability_score"].min()),
+                    "closeness_penalty": balance_penalty,
+                    "reference_penalty": reference_penalty,
+                    "replacements": float(replacement_count),
+                    **{
+                        f"spread_{name}": max_min_ratios[name] - 1.0
+                        for name in features
+                    },
+                    **{f"cv_{name}": value for name, value in cvs.items()},
+                    **{f"mean_{name}": value for name, value in cohort_levels.items()},
+                }
+        if best_cohort is not None:
+            return best_cohort.sort_values(
+                ["pd_suitability_score", "decode_pressure_proxy_p25"],
+                ascending=[False, False],
+            ).copy(), best_stats
+
+    raise ValueError(
+        "Cannot repair the old batch by replacing up to 6 short instances with "
+        "stable candidates similar to the remaining P/D distribution. Expand "
+        "--cohort-pool-size or relax the batch-balance limits."
+    )
+
+
 def _validate_tail_quantile(value: str | float) -> float:
     number = float(value)
     if not 0.0 < number <= 1.0:
@@ -616,8 +747,8 @@ def main() -> None:
     parser.add_argument(
         "--score-input",
         help=(
-            "Optional previously selected parquet to score against the current "
-            "--input candidate population. Does not affect the new selection."
+            "Optional previously selected batch. With --similar-cohort, keep its "
+            "main workload cluster and replace only short outliers."
         ),
     )
     parser.add_argument("--output", default="swe_rebench_pd64.parquet")
@@ -826,17 +957,28 @@ def main() -> None:
                 ),
             }
         try:
-            selected_summary, cohort_stats = select_similar_cohort(
-                summary,
-                args.num_samples,
-                args.cohort_pool_size,
-                args.cohort_closeness_weight,
-                args.cohort_reference_weight,
-                reference_levels,
-                args.max_cohort_cv,
-                args.max_cohort_max_min,
-                args.max_cohort_reference_ratio,
-            )
+            if reference_levels is not None:
+                selected_summary, cohort_stats = repair_reference_cohort(
+                    summary,
+                    args.num_samples,
+                    args.cohort_pool_size,
+                    args.max_cohort_cv,
+                    args.max_cohort_max_min,
+                    args.max_cohort_reference_ratio,
+                    reference_levels,
+                )
+            else:
+                selected_summary, cohort_stats = select_similar_cohort(
+                    summary,
+                    args.num_samples,
+                    args.cohort_pool_size,
+                    args.cohort_closeness_weight,
+                    args.cohort_reference_weight,
+                    reference_levels,
+                    args.max_cohort_cv,
+                    args.max_cohort_max_min,
+                    args.max_cohort_reference_ratio,
+                )
         except ValueError as exc:
             selected_summary = summary.iloc[0:0].copy()
             selection_error = exc
@@ -976,12 +1118,13 @@ def main() -> None:
         )
         if reference_levels is not None:
             print(
-                "Similar-cohort dynamic reference: "
+                "Repair-cohort original batch: "
                 f"P={reference_levels['p_work_proxy_mean']:.0f}, "
                 f"D={reference_levels['model_tokens_mean']:.0f}, "
                 f"D/P={reference_levels['decode_pressure_proxy']:.3f}, "
                 f"total={reference_levels['total_work_proxy_mean']:.0f} "
-                f"(selected/reference ratio<={args.max_cohort_reference_ratio:g})"
+                f"(replaced_short={int(cohort_stats['replacements'])}, "
+                f"replacement/core ratio<={args.max_cohort_reference_ratio:g})"
             )
         print(
             "Similar-cohort workload means: "
