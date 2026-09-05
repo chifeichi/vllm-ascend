@@ -1,1 +1,1 @@
-python -c 'import pandas as pd; x=pd.read_csv("swe_rebench_pd_selection.csv"); print(x[["p_work_proxy_mean","model_tokens_mean","decode_pressure_proxy","total_work_proxy_mean"]].quantile([0,.25,.5,.75,1]).round(3))'
+grep -Ei 'RegisterNode|register.*node|node.*registered|Failed to register' /tmp/ray/session_latest/logs/gcs_server.out | tail -30
